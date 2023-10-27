@@ -51,6 +51,8 @@ then
   TIMEOUT+=" -k 2s 45s "
 fi
 
+# echo $TIMEOUT
+# exit 0
 # run the test in a fresh sub-directory.
 rm -rf mr-tmp
 mkdir mr-tmp || exit 1
