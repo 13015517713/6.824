@@ -400,46 +400,45 @@ func (rf *Raft) startElection() bool {
 	}
 
 	tickets := 0
-	isFollower := false
-	isLeader := false
 	isTimeout := false
 
-	for !isTimeout && !isLeader {
+	for !isTimeout { // isFollower的话直接转换
+		rf.elect_lock.Lock()
+		if rf.status != Candidate { // 收到更大的term 立即变 follower, 收到票数过半 -> leader，都立即返回
+			rf.elect_lock.Unlock()
+			break
+		}
+		rf.elect_lock.Unlock()
+
 		select {
 		case <-timer:
 			debuger.DPrintf("pid = %v, timeout\n", rf.me)
 			isTimeout = true
 		case reply := <-rp_chan:
-			if !isFollower {
-				if reply.VoteGranted {
-					tickets++
-					if tickets >= len(rf.peers)/2 {
-						rf.elect_lock.Lock()
-						rf.status = Leader
-						isLeader = true
-						rf.elect_lock.Unlock()
-						debuger.DPrintf("pid = %v become leader\n", rf.me)
-					}
+			if reply.VoteGranted {
+				tickets++
+				if tickets >= len(rf.peers)/2 {
+					rf.elect_lock.Lock()
+					rf.status = Leader
+					rf.elect_lock.Unlock()
+					debuger.DPrintf("pid = %v become leader\n", rf.me)
 				}
-
+			} else {
 				// check一下：减少后续判断
 				rf.elect_lock.Lock()
 				if reply.Term > rf.term {
 					rf.term = reply.Term
 					rf.status = Follower
 					rf.voted_id = -1
-					isFollower = true
-				}
-				if rf.status == Follower {
-					isFollower = true
 				}
 				rf.elect_lock.Unlock()
-
 			}
 		}
 	}
 
-	return isLeader
+	rf.elect_lock.Lock()
+	defer rf.elect_lock.Unlock()
+	return rf.status == Leader
 }
 
 func (rf *Raft) sendHeartBeat() {
