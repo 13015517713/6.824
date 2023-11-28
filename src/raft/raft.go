@@ -70,7 +70,6 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	elect_lock sync.Mutex // guard the following
 	term       int
 	status     RaftStatus
 	leaderId   int
@@ -80,16 +79,15 @@ type Raft struct {
 	// 同时加锁顺序client_notifer条件变量先，elect先，rep后，防止死锁
 
 	// for all servers
-	rep_lock      sync.Mutex // guard the following include "for leader items"
 	log           []LogEntry
 	commitedIndex int
 	lastApplied   int
 	applyCh       chan ApplyMsg
 
 	// for leader
-	nextIndex            []int
-	matchIndex           []int
-	log_notifer          chan struct{}
+	nextIndex  []int
+	matchIndex []int
+	// log_notifer          chan struct{}
 	client_notifier_cond *sync.Cond
 	client_notifier_lock sync.Mutex
 }
@@ -103,8 +101,8 @@ type LogEntry struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
-	rf.elect_lock.Lock()
-	defer rf.elect_lock.Unlock()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	return rf.term, rf.status == Leader
 }
 
@@ -176,8 +174,8 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.elect_lock.Lock()
-	defer rf.elect_lock.Unlock()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	debuger.DPrintf("pid = %v, candidate = %v, args.Term = %v, rf.term = %v\n", rf.me, args.CandidateId, args.Term, rf.term)
 
@@ -187,25 +185,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else if args.Term > rf.term {
 		rf.term = args.Term
 		rf.status = Follower
-		rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
-		// rf.voted_id = args.CandidateId
 
 		// 检查日志是否更新，否则不同意
-		rf.rep_lock.Lock()
 		if len(rf.log) == 0 {
+			rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
 			rf.voted_id = args.CandidateId
 			reply.VoteGranted = true
 		} else {
+			// bug
+			debuger.DPrintf("pid = %v, args.LastLogTerm = %v, args.LastLogIdx = %v\n", rf.me, args.LastLogTerm, args.LastLogIdx)
+			debuger.DPrintf("pid = %v, my.LastLogTerm = %v, len(rf.log) = %v\n", rf.me, rf.log[len(rf.log)-1].Term, len(rf.log))
 			if args.LastLogTerm > rf.log[len(rf.log)-1].Term ||
 				(args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIdx >= len(rf.log)) {
 				rf.voted_id = args.CandidateId
 				reply.VoteGranted = true
+				rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
 			} else {
 				reply.VoteGranted = false
 			}
 		}
-
-		rf.rep_lock.Unlock()
 
 		reply.Term = rf.term
 		debuger.DPrintf("pid = %v, vote for %v\n", rf.me, args.CandidateId)
@@ -245,13 +243,12 @@ type AppendEntryReply struct {
 }
 
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
-	// 如果entrys为空，就是心跳
-	if len(args.Entries) == 0 {
-		rf.elect_lock.Lock()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if len(args.Entries) == 0 { // 心跳
 		if args.Term < rf.term {
 			reply.Term = rf.term
 			reply.Success = false
-			rf.elect_lock.Unlock()
 		} else {
 			rf.leaderId = args.LeaderId
 			rf.status = Follower
@@ -260,40 +257,56 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 				rf.term = args.Term
 			}
 			rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
-			rf.elect_lock.Unlock()
 
 			reply.Success = true
 			reply.Term = args.Term
 
-			// update commitIndex
-			rf.rep_lock.Lock()
-			if args.LeaderCommit > rf.commitedIndex {
-				if args.LeaderCommit > len(rf.log) {
-					rf.commitedIndex = len(rf.log)
-				} else {
-					rf.commitedIndex = args.LeaderCommit
+			// 当前机器log可能不一致，leader的commitindex不work。
+			// 找到最后一条leader同步后的最新log，再进行更新
+			lastidx := 0
+			for i := len(rf.log); i >= 1; i-- {
+				if rf.log[i-1].Term == args.Term {
+					lastidx = i
+					break
 				}
-				debuger.DPrintf("pid = %v, update commitIndex = %v\n", rf.me, rf.commitedIndex)
 			}
-			rf.rep_lock.Unlock()
+			debuger.DPrintf("pid = %v, lastidx = %v, leaderCommit = %v, commitedIndex = %v\n", rf.me, lastidx, args.LeaderCommit, rf.commitedIndex)
+			if lastidx != 0 {
+				if args.LeaderCommit > rf.commitedIndex {
+					if args.LeaderCommit > lastidx {
+						rf.commitedIndex = lastidx
+					} else {
+						rf.commitedIndex = args.LeaderCommit
+					}
+				}
+			}
+			// 更新committedIndex
+			// t := 0
+			// if args.PrevLogIndex < args.LeaderCommit {
+			// 	t = args.PrevLogIndex
+			// } else {
+			// 	t = args.LeaderCommit
+			// }
+			// if t > rf.commitedIndex {
+			// 	rf.commitedIndex = t
+			// }
+
+			debuger.DPrintf("pid = %v, update commitIndex = %v\n", rf.me, rf.commitedIndex)
 		}
 		debuger.DPrintf("pid = %v, receive heartbeat, leadId = %v, args.term = %v, rf.term = %v, alive_time = %v, cur_time = %v \n", rf.me, args.LeaderId, args.Term, rf.term, rf.alive_time, time.Now().UnixNano()/int64(time.Millisecond))
-	} else {
-		rf.elect_lock.Lock()
+	} else { // append
 		if args.Term < rf.term {
 			reply.Term = rf.term
 			reply.Success = false
-			rf.elect_lock.Unlock()
 		} else {
 			if args.Term > rf.term { // 我可能是个leader，变成follower直接开始work
 				rf.term = args.Term
 				rf.status = Follower
+				rf.voted_id = -1
 			}
 			rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
-			rf.elect_lock.Unlock()
 
 			// 先匹配PrevLogIndex和PrevLogTerm
-			rf.rep_lock.Lock()
 			if args.PrevLogIndex == 0 {
 				reply.Success = true
 				reply.Term = args.Term
@@ -309,32 +322,32 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			}
 			debuger.DPrintf("pid = %v append log status, PrevLogIndex = %v, PrevLogTerm = %v, reply = %v\n", rf.me, args.PrevLogIndex, args.PrevLogTerm, reply)
 			if reply.Success {
+				debuger.DPrintf("pid = %v, append entrys = %v, cur entrys = %v\n", rf.me, args.Entries, rf.log)
 				// 匹配成功后，删除后面其他任期的（其他leader时期没复制成功）
-				ads := len(rf.log)
-				for i := args.PrevLogIndex; i < len(rf.log); i++ {
-					if rf.log[i].Term != args.PrevLogTerm {
-						ads = i
-						rf.log = rf.log[:i]
+				for i := 0; i < len(args.Entries); i++ {
+					if args.PrevLogIndex+i >= len(rf.log) {
+						rf.log = append(rf.log, args.Entries[i:]...)
+						break
+					}
+					if args.Entries[i].Term != rf.log[args.PrevLogIndex+i].Term {
+						rf.log = rf.log[:args.PrevLogIndex+i]
+						rf.log = append(rf.log, args.Entries[i:]...)
 						break
 					}
 				}
-				// append同term但是目前没有的entry
-				had_cnt := ads - args.PrevLogIndex
-				if had_cnt < len(args.Entries) {
-					rf.log = append(rf.log, args.Entries[had_cnt:]...)
-				}
-				debuger.DPrintf("pid = %v, had_cnt = %v, lastest.Entries = %v\n", rf.me, had_cnt, rf.log)
-			}
 
-			if args.LeaderCommit > rf.commitedIndex {
-				if args.LeaderCommit > len(rf.log) {
-					rf.commitedIndex = len(rf.log)
-				} else {
-					rf.commitedIndex = args.LeaderCommit
+				debuger.DPrintf("pid = %v, lastest.Entries = %v\n", rf.me, rf.log)
+
+				// 更新committedIndex
+				if args.LeaderCommit > rf.commitedIndex {
+					if args.LeaderCommit > len(rf.log) {
+						rf.commitedIndex = len(rf.log)
+					} else {
+						rf.commitedIndex = args.LeaderCommit
+					}
 				}
 			}
 
-			rf.rep_lock.Unlock()
 		}
 		debuger.DPrintf("pid = %v receive append end, leadId = %v, args.term = %v, rf.term = %v, alive_time = %v, cur_time = %v \n", rf.me, args.LeaderId, args.Term, rf.term, rf.alive_time, time.Now().UnixNano()/int64(time.Millisecond))
 	}
@@ -398,26 +411,23 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	debuger.DPrintf("pid = %v, receive client command\n", rf.me)
 
-	rf.elect_lock.Lock()
+	rf.mu.Lock()
 	if rf.status != Leader {
-		rf.elect_lock.Unlock()
+		rf.mu.Unlock()
 		debuger.DPrintf("pid = %v, not leader\n", rf.me)
 		return index, term, false
 	}
 
-	rf.rep_lock.Lock()
 	E := LogEntry{
 		Command: command,
 		Term:    rf.term,
 	}
 	rf.log = append(rf.log, E)
 	term, index = rf.term, len(rf.log)
-	rf.rep_lock.Unlock()
-
-	rf.elect_lock.Unlock()
+	rf.mu.Unlock()
 
 	// 唤醒执行RSM
-	rf.log_notifer <- struct{}{}
+	// rf.log_notifer <- struct{}{}
 
 	// 等待唤醒可以提交。
 	// rf.client_notifier_lock.Lock()
@@ -463,27 +473,21 @@ const (
 	heartBeatInterval  int64 = 100
 	electInterval      int64 = 175
 	rpcErrorInterval   int64 = 10
-	selectIdleInterval int64 = 5
+	selectIdleInterval int64 = 10
 )
 
 func (rf *Raft) initLeader() {
-	// 周期发心跳
-	go func() {
-		isLeader := true
-		for isLeader {
-			rf.sendHeartBeat()
-			rf.elect_lock.Lock()
-			isLeader = rf.status == Leader
-			rf.elect_lock.Unlock()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.status != Leader {
+		return
+	}
 
-			if isLeader {
-				time.Sleep(time.Duration(heartBeatInterval) * time.Millisecond)
-			}
-		}
-	}()
+	go rf.sendHeartBeat(rf.term)
+
+	go rf.checkCommit(rf.term)
 
 	// 选举后初始化nextIndex和matchIndex
-	rf.rep_lock.Lock()
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
@@ -491,7 +495,12 @@ func (rf *Raft) initLeader() {
 		rf.nextIndex[i] = len(rf.log) + 1
 		rf.matchIndex[i] = 0
 	}
-	rf.rep_lock.Unlock()
+}
+
+func (rf *Raft) checkStatus(s RaftStatus) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.status == s
 }
 
 func (rf *Raft) ticker() {
@@ -499,28 +508,28 @@ func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		// Your code here (2A)
 		// Check if a leader election should be started.
-		rf.elect_lock.Lock()
+		rf.mu.Lock()
 		s := rf.status
-		rf.elect_lock.Unlock()
+		rf.mu.Unlock()
+
 		switch s {
 		case Follower:
 			r := electInterval
-			for {
+			for rf.killed() == false {
 				t := time.Now().UnixNano() / int64(time.Millisecond)
-				rf.elect_lock.Lock()
+				rf.mu.Lock()
 				a := rf.alive_time
-				rf.elect_lock.Unlock()
+				rf.mu.Unlock()
 				debuger.DPrintf("pid = %v, t = %v, a = %v, r = %v, interval = %v\n", rf.me, t, a, r, t-a)
 				if t-a < r {
-					// 时间没到，就sleep一段时间
-					// time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond)
+					// cpu idle
 					time.Sleep(time.Duration((r - (t - a))) * time.Millisecond)
 				} else {
-					rf.elect_lock.Lock()
+					rf.mu.Lock()
 					rf.status = Candidate
 					rf.term++
 					rf.voted_id = rf.me
-					rf.elect_lock.Unlock()
+					rf.mu.Unlock()
 					debuger.DPrintf("pid = %v become candidate\n", rf.me)
 					break
 				}
@@ -532,66 +541,46 @@ func (rf *Raft) ticker() {
 			}
 
 			// judge
-			rf.elect_lock.Lock()
-			if rf.status == Follower {
-				// 变成小弟后更新alive时间，不然选举失败后起点靠后容易超时
-				rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond) // 可有可无
-				debuger.DPrintf("pid = %v become follower, alive_time = %v\n", rf.me, rf.alive_time)
-				rf.elect_lock.Unlock()
+			if !rf.checkStatus(Candidate) {
 				break
 			}
+
+			rf.mu.Lock()
 			rf.term += 1
 			rf.voted_id = rf.me
-			rf.elect_lock.Unlock()
+			rf.mu.Unlock()
+
 			debuger.DPrintf("pid = %v elect failes\n", rf.me)
 
 		case Leader:
-			rf.initLeader()
+			rf.initLeader() // 心跳，检查commit，初始化NextIndex和MatchIndex
 
-			rf.elect_lock.Lock()
-			isLeader := rf.status == Leader
-			leader_term := rf.term // 只处理当前任期
-			rf.elect_lock.Unlock()
-			if !isLeader {
+			rf.mu.Lock()
+			if rf.status != Leader {
+				rf.mu.Unlock()
 				break
 			}
+			go rf.checkAppend(rf.term) // 为了简化实现，暂不用条件变量，循环检查
+			rf.mu.Unlock()
 
-			// 每当append成功唤醒检查是否可commit
-			go rf.checkCommit(leader_term)
+			for !rf.killed() && rf.checkStatus(Leader) {
 
-			// 两个等待的地方
-			// 1.等待客户端消息，唤醒log_notifer
-			// 2.等待append成功的消息，唤醒commit_check_notifer检查
-			debuger.DPrintf("pid = %v, leader work\n", rf.me)
-			for {
-				rf.elect_lock.Lock()
-				isLeader := rf.status == Leader
-				rf.elect_lock.Unlock()
-				if !isLeader {
-					break
-				}
-
-				// 变成follower之后，可能会阻塞在log_notifer等待客户端，所以设置为非阻塞
-				select {
-				case <-rf.log_notifer:
-					debuger.DPrintf("pid = %v, leader deals client command\n", rf.me)
-					for i := 0; i < len(rf.peers); i++ {
-						if i == rf.me {
-							continue
-						}
-						go func(i int) {
-							rf.appendLog(leader_term, i)
-						}(i)
-					}
-				default:
-					// do nothing
-				}
+				// // 变成follower之后，可能会阻塞在log_notifer等待客户端，所以设置为非阻塞
+				// select {
+				// case <-rf.log_notifer:
+				// 	debuger.DPrintf("pid = %v, leader deals client command\n", rf.me)
+				// 	for i := 0; i < len(rf.peers); i++ {
+				// 		if i == rf.me {
+				// 			continue
+				// 		}
+				// 		go rf.appendLog(rf.term, i)
+				// 	}
+				// default:
+				// 	// do nothing
+				// }
 
 				time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond) // 后续为了性能可以移除
 			}
-
-			// 不是Leader了，通知commit_check_notifer退出
-			// commit_check_notifer <- struct{}{}
 
 		default:
 			// do nothing
@@ -606,9 +595,9 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) checkApply() {
 	// 检查是否有新的entry可以commit
-	for rf.killed() == false {
+	for !rf.killed() {
 		time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond)
-		rf.rep_lock.Lock()
+		rf.mu.Lock()
 		if rf.lastApplied < rf.commitedIndex {
 			rf.lastApplied++
 			applyMsg := ApplyMsg{
@@ -616,35 +605,32 @@ func (rf *Raft) checkApply() {
 				Command:      rf.log[rf.lastApplied-1].Command,
 				CommandIndex: rf.lastApplied,
 			}
-			rf.rep_lock.Unlock()
-			rf.applyCh <- applyMsg
+			rf.mu.Unlock()
+			rf.applyCh <- applyMsg // 应该不用阻塞吧
 			debuger.DPrintf("pid = %v, applyMsg = %v\n", rf.me, applyMsg)
 		} else {
-			rf.rep_lock.Unlock()
+			rf.mu.Unlock()
 		}
 	}
 }
 
 func (rf *Raft) checkCommit(leader_term int) {
 	// 当前任期，检查并commit
-	for {
+	for !rf.killed() {
 		// <-commit_check_notifer // 用条件变量好像比较合适，因为信号器不用等待一定发送成功
 		time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond) // 先简化一下吧，不用条件变量了。
 		// 如何条件变量：阻塞等待有entrys同步成功检查是否多数派，条件是leader任期，commitIndex小于logs大小
 		// debuger.DPrintf("pid = %v, starts to commit check\n", rf.me)
 
 		// 先检查是不是leader
-		rf.elect_lock.Lock()
-		isLeader := rf.status == Leader && rf.term == leader_term
-		if !isLeader {
-			rf.elect_lock.Unlock()
-			break // 如果停了，有些还在发提交的要退出
-		} else {
-			rf.elect_lock.Unlock()
+		rf.mu.Lock()
+		if rf.status != Leader || rf.term != leader_term {
+			rf.mu.Unlock()
+			break
 		}
 
 		// 检查是否满足提交的条件
-		rf.rep_lock.Lock()
+		debuger.DPrintf("pid = %v, starts to commit check, commitedIndex = %v, len(log) = %v\n", rf.me, rf.commitedIndex, len(rf.log))
 		for i := len(rf.log); i > rf.commitedIndex; i-- {
 			// 多数客户端满足则提交
 			if rf.log[i-1].Term == leader_term {
@@ -664,85 +650,84 @@ func (rf *Raft) checkCommit(leader_term int) {
 				}
 			}
 		}
-		// debuger.DPrintf("pid = %v, commit check end, commitedIndex = %v\n", rf.me, rf.commitedIndex)
-		rf.rep_lock.Unlock()
+		rf.mu.Unlock()
+		debuger.DPrintf("pid = %v, commit check end, commitedIndex = %v, len(log) = %v\n", rf.me, rf.commitedIndex, len(rf.log))
 
 	}
 }
 
-func (rf *Raft) appendLog(leader_term int, peer_id int) {
-	debuger.DPrintf("pid = %v, appendLog to %v\n", rf.me, peer_id)
+func (rf *Raft) checkAppend(leader_term int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		go rf.appendPeer(leader_term, i)
+	}
+}
 
-	send_status := 0 // 0: 重发， 1: 不是leader了， 2:匹配成功
-	rf.rep_lock.Lock()
-	care_len := len(rf.log) // 保证这么多被同步完即可，其他append覆盖后本次请求完成，应该停止执行
-	rf.rep_lock.Unlock()
+func (rf *Raft) appendPeer(leader_term int, peer_id int) {
 	for {
-		if send_status != 0 {
+		time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond) // 批量检查提交
+
+		rf.mu.Lock()
+
+		if rf.status != Leader || rf.term != leader_term {
+			debuger.DPrintf("pid = %v, is not leader when appending to %v\n", rf.me, peer_id)
+			rf.mu.Unlock()
 			break
 		}
 
-		rf.rep_lock.Lock()
-		if rf.nextIndex[peer_id] <= care_len {
-			// prevLogIndex := rf.nextIndex[peer_id] - 1
+		debuger.DPrintf("pid = %v start to append to %v, nextIndex = %v, len rf.log = %v, matchIndex = %v\n", rf.me, peer_id, rf.nextIndex[peer_id], len(rf.log), rf.matchIndex[peer_id])
+		// if rf.nextIndex[peer_id] <= len(rf.log) { // 一直没发，有可能一个客户端啥也没有
+		if rf.nextIndex[peer_id] <= len(rf.log) {
+			prevLogIndex := rf.nextIndex[peer_id] - 1
 			args := AppendEntryArgs{
 				Term:         leader_term,
 				LeaderId:     rf.me,
-				PrevLogIndex: rf.nextIndex[peer_id] - 1,
-				PrevLogTerm:  rf.log[rf.nextIndex[peer_id]-1].Term,
-				Entries:      rf.log[rf.nextIndex[peer_id]-1:],
+				PrevLogIndex: prevLogIndex,
+				Entries:      rf.log[prevLogIndex:],
 				LeaderCommit: rf.commitedIndex,
 			}
-			rf.rep_lock.Unlock()
+			if prevLogIndex != 0 {
+				args.PrevLogTerm = rf.log[prevLogIndex-1].Term
+			}
+			rf.mu.Unlock()
+
 			reply := AppendEntryReply{}
 			f := rf.sendAppendEntry(peer_id, &args, &reply)
 			if !f {
-				time.Sleep(time.Duration(rpcErrorInterval) * time.Millisecond) // rpc失败就等一下再发
-			} else if !reply.Success {
-				if reply.Term > leader_term {
-					rf.elect_lock.Lock()
+				continue
+			}
+
+			rf.mu.Lock()
+			if rf.status != Leader || rf.term != leader_term {
+				rf.mu.Unlock()
+				break
+			}
+
+			debuger.DPrintf("pid = %v, append to %v, reply = %v\n", rf.me, peer_id, reply)
+			if !reply.Success {
+				if reply.Term > rf.term {
 					rf.term = reply.Term
 					rf.status = Follower
 					rf.voted_id = -1
-					rf.elect_lock.Unlock()
-					send_status = 1
+					rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
 				} else {
-					// 不匹配，重新发
-					rf.rep_lock.Lock()
 					rf.nextIndex[peer_id]--
-					rf.rep_lock.Unlock()
 				}
 			} else {
-				// 匹配，更新
-				rf.rep_lock.Lock()
-
 				// 更新nextIndex和matchIndex，和发送的保持一致
+				rf.matchIndex[peer_id] = rf.nextIndex[peer_id] + len(args.Entries) - 1
 				rf.nextIndex[peer_id] = len(rf.log) + 1
-				if rf.matchIndex[peer_id] < care_len {
-					rf.matchIndex[peer_id] = care_len
-				}
-
-				rf.rep_lock.Unlock()
-
-				debuger.DPrintf("pid = %v, append to %v success, notifier commit check\n", rf.me, peer_id)
-				send_status = 2
+				debuger.DPrintf("pid = %v, append to %v success, matchIndex = %v, nextIndex = %v\n", rf.me, peer_id, rf.matchIndex[peer_id], rf.nextIndex[peer_id])
 			}
-			debuger.DPrintf("pid = %v, send append to %v, f = %v, send_status = %v, args = %v, reply = %v\n",
-				rf.me, peer_id, f, send_status, args, reply)
+			rf.mu.Unlock()
 		} else {
-			send_status = 2
-			rf.rep_lock.Unlock()
+			rf.mu.Unlock()
 		}
-
-		// 检查是否还是leader，如果不是leader了，不用一直重试了
-		rf.elect_lock.Lock()
-		if rf.status != Leader {
-			send_status = 1
-		}
-		rf.elect_lock.Unlock()
-
 	}
-	debuger.DPrintf("pid = %v, appendLog to %v end\n", rf.me, peer_id)
 }
 
 func (rf *Raft) startElection() bool {
@@ -751,21 +736,17 @@ func (rf *Raft) startElection() bool {
 	timer := time.After(time.Duration(r) * time.Millisecond)
 	debuger.DPrintf("pid = %v, r = %v\n", rf.me, r)
 
-	rf.elect_lock.Lock()
-	cur_term := rf.term
-	rf.elect_lock.Unlock()
+	rf.mu.Lock()
 
-	rf.rep_lock.Lock()
 	lastLogIndex := len(rf.log)
 	lastLogTerm := 0
 	if lastLogIndex != 0 {
 		lastLogTerm = rf.log[lastLogIndex-1].Term
 	}
-	rf.rep_lock.Unlock()
 
 	rp_chan := make(chan RequestVoteReply, len(rf.peers)-1)
 	args := RequestVoteArgs{
-		Term:        cur_term,
+		Term:        rf.term,
 		CandidateId: rf.me,
 		LastLogIdx:  lastLogIndex,
 		LastLogTerm: lastLogTerm,
@@ -782,41 +763,33 @@ func (rf *Raft) startElection() bool {
 			}
 		}(i)
 	}
+	rf.mu.Unlock()
 
 	tickets := 0
 	isTimeout := false
 
-	for !isTimeout { // isFollower的话直接转换
-		rf.elect_lock.Lock()
-		if rf.status != Candidate { // 收到更大的term 立即变 follower, 收到票数过半 -> leader，都立即返回
-			rf.elect_lock.Unlock()
-			break
-		}
-		rf.elect_lock.Unlock()
-
+	for !isTimeout && rf.checkStatus(Candidate) { // isFollower的话直接转换
 		select {
 		case <-timer:
 			debuger.DPrintf("pid = %v, timeout\n", rf.me)
 			isTimeout = true
 		case reply := <-rp_chan:
+			rf.mu.Lock()
 			if reply.VoteGranted {
 				tickets++
 				if tickets >= len(rf.peers)/2 {
-					rf.elect_lock.Lock()
 					rf.status = Leader
-					rf.elect_lock.Unlock()
 					debuger.DPrintf("pid = %v become leader\n", rf.me)
 				}
 			} else {
 				// check一下：减少后续判断
-				rf.elect_lock.Lock()
 				if reply.Term > rf.term {
 					rf.term = reply.Term
 					rf.status = Follower
 					rf.voted_id = -1
 				}
-				rf.elect_lock.Unlock()
 			}
+			rf.mu.Unlock()
 		default:
 			// do nothing
 			time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond)
@@ -824,42 +797,54 @@ func (rf *Raft) startElection() bool {
 
 	}
 
-	rf.elect_lock.Lock()
-	defer rf.elect_lock.Unlock()
-	return rf.status == Leader
+	return rf.checkStatus(Leader)
 }
 
-func (rf *Raft) sendHeartBeat() {
-	rf.elect_lock.Lock()
-	cur_term := rf.term
-	rf.elect_lock.Unlock()
-
-	args := AppendEntryArgs{}
-	args.Term = cur_term
-	args.LeaderId = rf.me
-	rf.rep_lock.Lock()
-	args.LeaderCommit = rf.commitedIndex
-	rf.rep_lock.Unlock()
-
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
+func (rf *Raft) sendHeartBeat(leader_term int) {
+	for {
+		rf.mu.Lock()
+		if rf.status != Leader || rf.term != leader_term {
+			rf.mu.Unlock()
+			break
 		}
-		go func(i int) {
-			reply := AppendEntryReply{}
-			f := rf.sendAppendEntry(i, &args, &reply)
-			if f {
-				rf.elect_lock.Lock()
-				if reply.Term > rf.term {
-					rf.term = reply.Term
-					rf.status = Follower
-					rf.voted_id = -1
-				}
-				rf.elect_lock.Unlock()
+
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
 			}
-		}(i)
+			go func(i int) {
+				rf.mu.Lock()
+				if rf.status != Leader || rf.term != leader_term {
+					rf.mu.Unlock()
+					return
+				}
+				args := AppendEntryArgs{}
+				args.Term = rf.term
+				args.LeaderId = rf.me
+				args.LeaderCommit = rf.commitedIndex
+				// args.PrevLogIndex = rf.matchIndex[i] // 用于follower提交
+				rf.mu.Unlock()
+
+				reply := AppendEntryReply{}
+				f := rf.sendAppendEntry(i, &args, &reply)
+				if f {
+					rf.mu.Lock()
+					if reply.Term > rf.term {
+						rf.term = reply.Term
+						rf.status = Follower
+						rf.voted_id = -1
+						rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
+					}
+					rf.mu.Unlock()
+				}
+			}(i)
+		}
+		rf.mu.Unlock()
+
+		debuger.DPrintf("pid = %v, send heartbeat, time = %v\n", rf.me, time.Now().UnixNano()/int64(time.Millisecond))
+
+		time.Sleep(time.Duration(heartBeatInterval) * time.Millisecond)
 	}
-	debuger.DPrintf("pid = %v, send heartbeat, time = %v\n", rf.me, time.Now().UnixNano()/int64(time.Millisecond))
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -883,8 +868,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		voted_id:      -1,
 		commitedIndex: 0,
 		lastApplied:   0,
-		log_notifer:   make(chan struct{}, 100), // 多创建几个channel，提高性能，用于客户端通知有消息来
-		applyCh:       applyCh,
+		// log_notifer:   make(chan struct{}, 100), // 多创建几个channel，提高性能，用于客户端通知有消息来
+		applyCh: applyCh,
 	}
 	rf.client_notifier_cond = sync.NewCond(&rf.client_notifier_lock)
 
