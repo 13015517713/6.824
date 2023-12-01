@@ -305,6 +305,9 @@ type AppendEntryArgs struct {
 type AppendEntryReply struct {
 	Term    int
 	Success bool
+
+	// 优化nextIndex的交互
+	NextIndex int
 }
 
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
@@ -338,7 +341,6 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 					break
 				}
 			}
-			debuger.DPrintf("pid = %v, lastidx = %v, leaderCommit = %v, commitedIndex = %v\n", rf.me, lastidx, args.LeaderCommit, rf.commitedIndex)
 			if lastidx != 0 {
 				if args.LeaderCommit > rf.commitedIndex {
 					if args.LeaderCommit > lastidx {
@@ -348,7 +350,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 					}
 				}
 			}
-
+			debuger.DPrintf("pid = %v, lastidx = %v, leaderCommit = %v, commitedIndex = %v\n", rf.me, lastidx, args.LeaderCommit, rf.commitedIndex)
 			debuger.DPrintf("pid = %v, update commitIndex = %v\n", rf.me, rf.commitedIndex)
 		}
 
@@ -411,6 +413,9 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 					}
 				}
 				needPersist = true
+			} else {
+				// 优化返回nextIndex，发commitIndex的位置，可以允许多发
+				reply.NextIndex = rf.commitedIndex + 1
 			}
 
 		}
@@ -649,7 +654,6 @@ func (rf *Raft) ticker() {
 func (rf *Raft) checkApply() {
 	// 检查是否有新的entry可以commit
 	for !rf.killed() {
-		time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond)
 		rf.mu.Lock()
 		if rf.lastApplied < rf.commitedIndex {
 			rf.lastApplied++
@@ -665,7 +669,7 @@ func (rf *Raft) checkApply() {
 			} else {
 				rf.emptyEntryNum++
 			}
-			debuger.DPrintf("pid = %v, applyMsg = %v, all applied = %v\n", rf.me, applyMsg, rf.log[:rf.lastApplied])
+			debuger.DPrintf("pid = %v, applyMsg = %v, appliedlen = %v, hadcommitted = %v\n", rf.me, applyMsg, rf.lastApplied, rf.commitedIndex)
 			rf.mu.Unlock()
 
 			rf.mu.Lock()
@@ -674,6 +678,7 @@ func (rf *Raft) checkApply() {
 
 		} else {
 			rf.mu.Unlock()
+			time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond)
 		}
 	}
 }
@@ -737,8 +742,6 @@ func (rf *Raft) checkAppend(leader_term int) {
 
 func (rf *Raft) appendPeer(leader_term int, peer_id int) {
 	for {
-		time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond) // 批量检查提交
-
 		rf.mu.Lock()
 
 		if rf.status != Leader || rf.term != leader_term {
@@ -766,7 +769,6 @@ func (rf *Raft) appendPeer(leader_term int, peer_id int) {
 			reply := AppendEntryReply{}
 			f := rf.sendAppendEntry(peer_id, &args, &reply)
 			if !f {
-				debuger.DPrintf("pid = %v, append to %v, return = error, args = %+v\n", rf.me, peer_id, args)
 				continue
 			} else {
 				debuger.DPrintf("pid = %v, append to %v, reply = %v, args = %+v\n", rf.me, peer_id, reply, args)
@@ -785,8 +787,8 @@ func (rf *Raft) appendPeer(leader_term int, peer_id int) {
 					rf.voted_id = -1
 					rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
 				} else {
-					rf.nextIndex[peer_id]--
-					debuger.DPrintf("pid = %v, append to %v not match, matchIndex = %v, nextIndex = %v\n", rf.me, peer_id, rf.matchIndex[peer_id], rf.nextIndex[peer_id])
+					rf.nextIndex[peer_id] = reply.NextIndex
+					debuger.DPrintf("pid = %v, append to %v not match, matchIndex = %v, nextIndex = %v, reply = %+v\n", rf.me, peer_id, rf.matchIndex[peer_id], rf.nextIndex[peer_id], reply)
 				}
 			} else {
 				// 更新nextIndex和matchIndex，和发送的保持一致
@@ -798,6 +800,7 @@ func (rf *Raft) appendPeer(leader_term int, peer_id int) {
 			rf.mu.Unlock()
 		} else {
 			rf.mu.Unlock()
+			time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond) // 批量检查提交
 		}
 	}
 }
@@ -914,15 +917,13 @@ func (rf *Raft) sendHeartBeat(leader_term int) {
 						rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
 						rf.persist()
 					}
-				} else {
-					debuger.DPrintf("pid = %v, send heartbeat to %v, return = error, context = %+v, cur_term = %v, reply = %v\n", rf.me, i, args, rf.term, reply)
 				}
 				rf.mu.Unlock()
 			}(i)
 		}
 		rf.mu.Unlock()
 
-		debuger.DPrintf("pid = %v, send heartbeat, time = %v\n", rf.me, time.Now().UnixNano()/int64(time.Millisecond))
+		// debuger.DPrintf("pid = %v, send heartbeat, time = %v\n", rf.me, time.Now().UnixNano()/int64(time.Millisecond))
 
 		time.Sleep(time.Duration(heartBeatInterval) * time.Millisecond)
 	}
