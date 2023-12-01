@@ -90,11 +90,12 @@ type Raft struct {
 	// for leader
 	nextIndex  []int
 	matchIndex []int
-	// log_notifer          chan struct{}
-	client_notifier_cond *sync.Cond
-	client_notifier_lock sync.Mutex
 
 	emptyEntryNum int
+
+	// cond notify checkcommit
+	commitCondMu sync.Mutex
+	commitCond   *sync.Cond
 }
 
 type RaftPersist struct {
@@ -255,6 +256,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.status = Follower
 			rf.voted_id = -1
 			needPersist = true
+			rf.commitCond.Signal() // 降级也会唤醒
 		}
 		if rf.status == Follower && rf.voted_id == -1 {
 			// 检查日志是否更新，否则不同意
@@ -325,6 +327,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			rf.voted_id = -1
 			if rf.term < args.Term {
 				rf.term = args.Term
+				rf.commitCond.Signal() // 降级也会唤醒
 			}
 			rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
 			needPersist = true
@@ -365,6 +368,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 				rf.status = Follower
 				rf.voted_id = -1
 				needPersist = true
+				rf.commitCond.Signal() // 降级也会唤醒
 			}
 			rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
 
@@ -556,7 +560,7 @@ func (rf *Raft) initLeader() {
 
 	go rf.sendHeartBeat(rf.term)
 
-	go rf.checkCommit(rf.term)
+	go rf.checkAppend(rf.term)
 
 	// 选举后初始化nextIndex和matchIndex
 	for i := 0; i < len(rf.peers); i++ {
@@ -629,17 +633,23 @@ func (rf *Raft) ticker() {
 		case Leader:
 			rf.initLeader() // 心跳，检查commit，初始化NextIndex和MatchIndex
 
-			rf.mu.Lock()
-			if rf.status != Leader {
-				rf.mu.Unlock()
+			leader_term, isLeader := rf.GetState()
+			if !isLeader {
 				break
 			}
-			go rf.checkAppend(rf.term) // 为了简化实现，暂不用条件变量，循环检查
-			rf.mu.Unlock()
 
-			for !rf.killed() && rf.checkStatus(Leader) {
-				time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond)
+			// 当append成功后，唤醒检查
+			// 当leader降级后，唤醒检查
+			rf.mu.Lock()
+			for {
+				rf.commitCond.Wait()
+				if rf.status == Leader {
+					rf.checkCommitOnce(leader_term)
+				} else {
+					break
+				}
 			}
+			rf.mu.Unlock()
 
 		default:
 			// do nothing
@@ -685,7 +695,7 @@ func (rf *Raft) checkCommit(leader_term int) {
 	// 当前任期，检查并commit
 	for !rf.killed() {
 		// <-commit_check_notifer // 用条件变量好像比较合适，因为信号器不用等待一定发送成功
-		time.Sleep(time.Duration(selectIdleInterval*3) * time.Millisecond) // 先简化一下吧，不用条件变量了。
+		time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond) // 先简化一下吧，不用条件变量了。
 		// 如何条件变量：阻塞等待有entrys同步成功检查是否多数派，条件是leader任期，commitIndex小于logs大小
 		// debuger.DPrintf("pid = %v, starts to commit check\n", rf.me)
 
@@ -714,7 +724,7 @@ func (rf *Raft) checkCommit(leader_term int) {
 				}
 				if cnt >= len(rf.peers)/2+1 {
 					rf.commitedIndex = i
-					rf.persist()
+					// rf.persist()
 
 					debuger.DPrintf("pid = %v, commit entry = %v, index = %v\n", rf.me, rf.log[i-1], rf.commitedIndex)
 					break
@@ -725,6 +735,27 @@ func (rf *Raft) checkCommit(leader_term int) {
 		debuger.DPrintf("pid = %v, commit check end, commitedIndex = %v, len(log) = %v, peers = %v\n", rf.me, rf.commitedIndex, len(rf.log), p)
 
 	}
+}
+
+func (rf *Raft) checkCommitOnce(leader_term int) {
+	for i := len(rf.log); i > rf.commitedIndex; i-- {
+		if rf.log[i-1].Term == leader_term {
+			cnt := 1
+			for j := 0; j < len(rf.peers); j++ {
+				if j == rf.me {
+					continue
+				}
+				if rf.matchIndex[j] >= i {
+					cnt++
+				}
+			}
+			if cnt >= len(rf.peers)/2+1 {
+				rf.commitedIndex = i
+				break
+			}
+		}
+	}
+	debuger.DPrintf("pid = %v, commit check end, commitedIndex = %v, len(log) = %v\n", rf.me, rf.commitedIndex, len(rf.log))
 }
 
 func (rf *Raft) checkAppend(leader_term int) {
@@ -784,6 +815,7 @@ func (rf *Raft) appendPeer(leader_term int, peer_id int) {
 					rf.status = Follower
 					rf.voted_id = -1
 					rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
+					rf.commitCond.Signal() // 降级也会唤醒
 				} else {
 					rf.nextIndex[peer_id] = reply.NextIndex
 					debuger.DPrintf("pid = %v, append to %v not match, matchIndex = %v, nextIndex = %v, reply = %+v\n", rf.me, peer_id, rf.matchIndex[peer_id], rf.nextIndex[peer_id], reply)
@@ -792,6 +824,7 @@ func (rf *Raft) appendPeer(leader_term int, peer_id int) {
 				// 更新nextIndex和matchIndex，和发送的保持一致
 				rf.matchIndex[peer_id] = rf.nextIndex[peer_id] + len(args.Entries) - 1
 				rf.nextIndex[peer_id] = len(rf.log) + 1
+				rf.commitCond.Signal()
 				debuger.DPrintf("pid = %v, append to %v success, matchIndex = %v, nextIndex = %v\n", rf.me, peer_id, rf.matchIndex[peer_id], rf.nextIndex[peer_id])
 			}
 			rf.persist()
@@ -913,6 +946,7 @@ func (rf *Raft) sendHeartBeat(leader_term int) {
 						rf.status = Follower
 						rf.voted_id = -1
 						rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
+						rf.commitCond.Signal() // 降级也会唤醒
 						rf.persist()
 					}
 				}
@@ -952,7 +986,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		applyCh:       applyCh,
 		emptyEntryNum: 0,
 	}
-	rf.client_notifier_cond = sync.NewCond(&rf.client_notifier_lock)
+	rf.commitCond = sync.NewCond(&rf.mu)
 
 	// Your initialization code here (2A, 2B, 2C).
 	for i := 0; i < len(peers); i++ {
