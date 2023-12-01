@@ -94,8 +94,8 @@ type Raft struct {
 	emptyEntryNum int
 
 	// cond notify checkcommit
-	commitCondMu sync.Mutex
-	commitCond   *sync.Cond
+	commitCond *sync.Cond
+	applyCond  *sync.Cond
 }
 
 type RaftPersist struct {
