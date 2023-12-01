@@ -20,6 +20,8 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
+
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -27,6 +29,7 @@ import (
 
 	//	"6.5840/labgob"
 	debuger "6.5840/helper"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -90,6 +93,52 @@ type Raft struct {
 	// log_notifer          chan struct{}
 	client_notifier_cond *sync.Cond
 	client_notifier_lock sync.Mutex
+
+	emptyEntryNum int
+}
+
+type RaftPersist struct {
+	// 需要持久化的raft变量
+	Me       int
+	Term     int
+	Status   RaftStatus
+	Voted_id int
+
+	Log []LogEntry
+	// commitedIndex int // 这个可以可无感觉
+	LastApplied int
+
+	// for leader
+	NextIndex  []int
+	MatchIndex []int
+}
+
+func (rf *Raft) getPersistField() RaftPersist {
+	return RaftPersist{
+		Me:       rf.me,
+		Term:     rf.term,
+		Status:   rf.status,
+		Voted_id: rf.voted_id,
+
+		Log:         rf.log,
+		LastApplied: rf.lastApplied,
+
+		NextIndex:  rf.nextIndex,
+		MatchIndex: rf.matchIndex,
+	}
+}
+
+func (rf *Raft) setPersistField(r *RaftPersist) {
+	rf.me = r.Me
+	rf.term = r.Term
+	rf.status = r.Status
+	rf.voted_id = r.Voted_id
+
+	rf.log = r.Log
+	rf.lastApplied = r.LastApplied
+
+	rf.nextIndex = r.NextIndex
+	rf.matchIndex = r.MatchIndex
 }
 
 type LogEntry struct {
@@ -122,6 +171,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	// 存储当前raft状态，用于机器重启时回复
+	// var buffer bytes.Buffer
+	// encoder := labgob.NewEncoder(&buffer)
+	// encoder.Encode(rf.getPersistField())
+	// data := buffer.Bytes()
+	// // debuger.DPrintf("pid = %v, persist, rf = %v, len = %v\n", rf.me, rf.getPersistField(), len(data))
+	// rf.persister.Save(data, nil)
 }
 
 // restore previously persisted state.
@@ -142,6 +199,12 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	// 读取持久化的状态
+	var p RaftPersist
+	decoder := labgob.NewDecoder(bytes.NewBuffer(data))
+	decoder.Decode(&p)
+	rf.setPersistField(&p)
 }
 
 // the service says it has created a snapshot that has
@@ -179,50 +242,52 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	debuger.DPrintf("pid = %v, candidate = %v, args.Term = %v, rf.term = %v\n", rf.me, args.CandidateId, args.Term, rf.term)
 
+	needPersist := false
+
 	if args.Term < rf.term {
 		reply.Term = rf.term
 		reply.VoteGranted = false
-	} else if args.Term > rf.term {
-		rf.term = args.Term
-		rf.status = Follower
+	} else {
+		// 不是你比我大,我就同意你.有可能脑裂,一边一直选举term更大.
 
-		// 检查日志是否更新，否则不同意
-		if len(rf.log) == 0 {
-			rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
-			rf.voted_id = args.CandidateId
-			reply.VoteGranted = true
-		} else {
-			// bug
-			debuger.DPrintf("pid = %v, args.LastLogTerm = %v, args.LastLogIdx = %v\n", rf.me, args.LastLogTerm, args.LastLogIdx)
-			debuger.DPrintf("pid = %v, my.LastLogTerm = %v, len(rf.log) = %v\n", rf.me, rf.log[len(rf.log)-1].Term, len(rf.log))
-			if args.LastLogTerm > rf.log[len(rf.log)-1].Term ||
-				(args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIdx >= len(rf.log)) {
+		if args.Term > rf.term {
+			rf.term = args.Term
+			rf.status = Follower
+			rf.voted_id = -1
+			needPersist = true
+		}
+		if rf.status == Follower && rf.voted_id == -1 {
+			// 检查日志是否更新，否则不同意
+			if len(rf.log) == 0 {
+				rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
 				rf.voted_id = args.CandidateId
 				reply.VoteGranted = true
-				rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
+				needPersist = true
 			} else {
-				reply.VoteGranted = false
+				debuger.DPrintf("pid = %v, args.LastLogTerm = %v, args.LastLogIdx = %v\n", rf.me, args.LastLogTerm, args.LastLogIdx)
+				debuger.DPrintf("pid = %v, my.LastLogTerm = %v, len(rf.log) = %v\n", rf.me, rf.log[len(rf.log)-1].Term, len(rf.log))
+				if args.LastLogTerm > rf.log[len(rf.log)-1].Term ||
+					(args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIdx >= len(rf.log)) {
+					rf.voted_id = args.CandidateId
+					reply.VoteGranted = true
+					rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
+					needPersist = true
+				} else {
+					reply.VoteGranted = false
+				}
 			}
-		}
-
-		reply.Term = rf.term
-		debuger.DPrintf("pid = %v, vote for %v\n", rf.me, args.CandidateId)
-	} else {
-		// 同term，先到先得
-		debuger.DPrintf("term equal: pid = %v, args.CandidateId = %v, rf.voted_id = %v\n", rf.me, args.CandidateId, rf.voted_id)
-		if rf.status == Follower && rf.voted_id == -1 {
-
-			rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
-			rf.voted_id = args.CandidateId
-
-			reply.Term = rf.term
-			reply.VoteGranted = true
-			debuger.DPrintf("pid = %v, vote for %v\n", rf.me, args.CandidateId)
 		} else {
-			reply.Term = rf.term
 			reply.VoteGranted = false
 		}
+		reply.Term = rf.term
+		debuger.DPrintf("pid = %v, vote for %v, self log = %v, args = %v, reply = %v\n", rf.me, args.CandidateId, rf.log, args, reply)
 	}
+
+	if needPersist {
+		// 返回前写入，防止多次投票
+		rf.persist()
+	}
+
 }
 
 type AppendEntryArgs struct {
@@ -245,6 +310,8 @@ type AppendEntryReply struct {
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	needPersist := false
 	if len(args.Entries) == 0 { // 心跳
 		if args.Term < rf.term {
 			reply.Term = rf.term
@@ -257,6 +324,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 				rf.term = args.Term
 			}
 			rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
+			needPersist = true
 
 			reply.Success = true
 			reply.Term = args.Term
@@ -280,19 +348,10 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 					}
 				}
 			}
-			// 更新committedIndex
-			// t := 0
-			// if args.PrevLogIndex < args.LeaderCommit {
-			// 	t = args.PrevLogIndex
-			// } else {
-			// 	t = args.LeaderCommit
-			// }
-			// if t > rf.commitedIndex {
-			// 	rf.commitedIndex = t
-			// }
 
 			debuger.DPrintf("pid = %v, update commitIndex = %v\n", rf.me, rf.commitedIndex)
 		}
+
 		debuger.DPrintf("pid = %v, receive heartbeat, leadId = %v, args.term = %v, rf.term = %v, alive_time = %v, cur_time = %v \n", rf.me, args.LeaderId, args.Term, rf.term, rf.alive_time, time.Now().UnixNano()/int64(time.Millisecond))
 	} else { // append
 		if args.Term < rf.term {
@@ -303,6 +362,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 				rf.term = args.Term
 				rf.status = Follower
 				rf.voted_id = -1
+				needPersist = true
 			}
 			rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
 
@@ -319,7 +379,11 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 					reply.Success = false
 					reply.Term = args.Term
 				}
+			} else {
+				reply.Success = false
+				reply.Term = args.Term
 			}
+
 			debuger.DPrintf("pid = %v append log status, PrevLogIndex = %v, PrevLogTerm = %v, reply = %v\n", rf.me, args.PrevLogIndex, args.PrevLogTerm, reply)
 			if reply.Success {
 				debuger.DPrintf("pid = %v, append entrys = %v, cur entrys = %v\n", rf.me, args.Entries, rf.log)
@@ -346,10 +410,14 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 						rf.commitedIndex = args.LeaderCommit
 					}
 				}
+				needPersist = true
 			}
 
 		}
 		debuger.DPrintf("pid = %v receive append end, leadId = %v, args.term = %v, rf.term = %v, alive_time = %v, cur_time = %v \n", rf.me, args.LeaderId, args.Term, rf.term, rf.alive_time, time.Now().UnixNano()/int64(time.Millisecond))
+	}
+	if needPersist {
+		rf.persist()
 	}
 }
 
@@ -422,32 +490,21 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 		Term:    rf.term,
 	}
+	valid_cnt := 0
+	for i := 0; i < len(rf.log); i++ {
+		if rf.log[i].Command != nil {
+			valid_cnt++
+		}
+	}
+	term, index = rf.term, valid_cnt+1
 	rf.log = append(rf.log, E)
-	term, index = rf.term, len(rf.log)
+	if isLeader {
+		debuger.DPrintf("pid = %v handle client command = %v, index = %v, term = %v, logs = %v\n", rf.me, command, index, term, rf.log)
+	}
+
 	rf.mu.Unlock()
 
-	// 唤醒执行RSM
-	// rf.log_notifer <- struct{}{}
-
-	// 等待唤醒可以提交。
-	// rf.client_notifier_lock.Lock()
-	// lastApplied := -1
-	// for isLeader && lastApplied < index {
-	// 	rf.client_notifier_cond.Wait()
-
-	// 	rf.elect_lock.Lock() // 注意加锁的顺序
-	// 	if rf.status != Leader {
-	// 		isLeader = false
-	// 	}
-	// 	rf.elect_lock.Unlock()
-
-	// 	rf.rep_lock.Lock()
-	// 	lastApplied = rf.lastApplied
-	// 	rf.rep_lock.Unlock()
-	// }
-	// rf.client_notifier_lock.Unlock()
-
-	return index, term, isLeader
+	return index, term, isLeader // 要不要考虑持久化呢。
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -471,10 +528,18 @@ func (rf *Raft) killed() bool {
 
 const (
 	heartBeatInterval  int64 = 100
-	electInterval      int64 = 175
+	electInterval      int64 = 300
 	rpcErrorInterval   int64 = 10
 	selectIdleInterval int64 = 10
 )
+
+func (rf *Raft) appendEmptyForCatch() {
+	// 发一个空的，帮助其他匹配
+	rf.log = append(rf.log, LogEntry{
+		Command: nil,
+		Term:    rf.term,
+	})
+}
 
 func (rf *Raft) initLeader() {
 	rf.mu.Lock()
@@ -495,6 +560,7 @@ func (rf *Raft) initLeader() {
 		rf.nextIndex[i] = len(rf.log) + 1
 		rf.matchIndex[i] = 0
 	}
+	// rf.appendEmptyForCatch()
 }
 
 func (rf *Raft) checkStatus(s RaftStatus) bool {
@@ -505,7 +571,7 @@ func (rf *Raft) checkStatus(s RaftStatus) bool {
 
 func (rf *Raft) ticker() {
 
-	for rf.killed() == false {
+	for !rf.killed() {
 		// Your code here (2A)
 		// Check if a leader election should be started.
 		rf.mu.Lock()
@@ -515,7 +581,7 @@ func (rf *Raft) ticker() {
 		switch s {
 		case Follower:
 			r := electInterval
-			for rf.killed() == false {
+			for !rf.killed() {
 				t := time.Now().UnixNano() / int64(time.Millisecond)
 				rf.mu.Lock()
 				a := rf.alive_time
@@ -529,8 +595,9 @@ func (rf *Raft) ticker() {
 					rf.status = Candidate
 					rf.term++
 					rf.voted_id = rf.me
-					rf.mu.Unlock()
 					debuger.DPrintf("pid = %v become candidate\n", rf.me)
+					rf.persist()
+					rf.mu.Unlock()
 					break
 				}
 			}
@@ -548,6 +615,7 @@ func (rf *Raft) ticker() {
 			rf.mu.Lock()
 			rf.term += 1
 			rf.voted_id = rf.me
+			rf.persist()
 			rf.mu.Unlock()
 
 			debuger.DPrintf("pid = %v elect failes\n", rf.me)
@@ -564,22 +632,7 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 
 			for !rf.killed() && rf.checkStatus(Leader) {
-
-				// // 变成follower之后，可能会阻塞在log_notifer等待客户端，所以设置为非阻塞
-				// select {
-				// case <-rf.log_notifer:
-				// 	debuger.DPrintf("pid = %v, leader deals client command\n", rf.me)
-				// 	for i := 0; i < len(rf.peers); i++ {
-				// 		if i == rf.me {
-				// 			continue
-				// 		}
-				// 		go rf.appendLog(rf.term, i)
-				// 	}
-				// default:
-				// 	// do nothing
-				// }
-
-				time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond) // 后续为了性能可以移除
+				time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond)
 			}
 
 		default:
@@ -605,9 +658,20 @@ func (rf *Raft) checkApply() {
 				Command:      rf.log[rf.lastApplied-1].Command,
 				CommandIndex: rf.lastApplied,
 			}
+
+			if applyMsg.Command != nil {
+				applyMsg.CommandIndex -= rf.emptyEntryNum
+				rf.applyCh <- applyMsg
+			} else {
+				rf.emptyEntryNum++
+			}
+			debuger.DPrintf("pid = %v, applyMsg = %v, all applied = %v\n", rf.me, applyMsg, rf.log[:rf.lastApplied])
 			rf.mu.Unlock()
-			rf.applyCh <- applyMsg // 应该不用阻塞吧
-			debuger.DPrintf("pid = %v, applyMsg = %v\n", rf.me, applyMsg)
+
+			rf.mu.Lock()
+			rf.persist()
+			rf.mu.Unlock()
+
 		} else {
 			rf.mu.Unlock()
 		}
@@ -618,7 +682,7 @@ func (rf *Raft) checkCommit(leader_term int) {
 	// 当前任期，检查并commit
 	for !rf.killed() {
 		// <-commit_check_notifer // 用条件变量好像比较合适，因为信号器不用等待一定发送成功
-		time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond) // 先简化一下吧，不用条件变量了。
+		time.Sleep(time.Duration(selectIdleInterval*3) * time.Millisecond) // 先简化一下吧，不用条件变量了。
 		// 如何条件变量：阻塞等待有entrys同步成功检查是否多数派，条件是leader任期，commitIndex小于logs大小
 		// debuger.DPrintf("pid = %v, starts to commit check\n", rf.me)
 
@@ -630,7 +694,8 @@ func (rf *Raft) checkCommit(leader_term int) {
 		}
 
 		// 检查是否满足提交的条件
-		debuger.DPrintf("pid = %v, starts to commit check, commitedIndex = %v, len(log) = %v\n", rf.me, rf.commitedIndex, len(rf.log))
+		debuger.DPrintf("pid = %v, term = %v, starts to commit check, commitedIndex = %v, log = %v\n", rf.me, rf.term, rf.commitedIndex, rf.log)
+		p := []int{rf.me}
 		for i := len(rf.log); i > rf.commitedIndex; i-- {
 			// 多数客户端满足则提交
 			if rf.log[i-1].Term == leader_term {
@@ -641,17 +706,20 @@ func (rf *Raft) checkCommit(leader_term int) {
 					}
 					if rf.matchIndex[j] >= i {
 						cnt++
+						p = append(p, j)
 					}
 				}
 				if cnt >= len(rf.peers)/2+1 {
 					rf.commitedIndex = i
+					// rf.persist()
+
 					debuger.DPrintf("pid = %v, commit entry = %v, index = %v\n", rf.me, rf.log[i-1], rf.commitedIndex)
 					break
 				}
 			}
 		}
 		rf.mu.Unlock()
-		debuger.DPrintf("pid = %v, commit check end, commitedIndex = %v, len(log) = %v\n", rf.me, rf.commitedIndex, len(rf.log))
+		debuger.DPrintf("pid = %v, commit check end, commitedIndex = %v, len(log) = %v, peers = %v\n", rf.me, rf.commitedIndex, len(rf.log), p)
 
 	}
 }
@@ -680,7 +748,7 @@ func (rf *Raft) appendPeer(leader_term int, peer_id int) {
 		}
 
 		debuger.DPrintf("pid = %v start to append to %v, nextIndex = %v, len rf.log = %v, matchIndex = %v\n", rf.me, peer_id, rf.nextIndex[peer_id], len(rf.log), rf.matchIndex[peer_id])
-		// if rf.nextIndex[peer_id] <= len(rf.log) { // 一直没发，有可能一个客户端啥也没有
+
 		if rf.nextIndex[peer_id] <= len(rf.log) {
 			prevLogIndex := rf.nextIndex[peer_id] - 1
 			args := AppendEntryArgs{
@@ -698,7 +766,10 @@ func (rf *Raft) appendPeer(leader_term int, peer_id int) {
 			reply := AppendEntryReply{}
 			f := rf.sendAppendEntry(peer_id, &args, &reply)
 			if !f {
+				debuger.DPrintf("pid = %v, append to %v, return = error, args = %+v\n", rf.me, peer_id, args)
 				continue
+			} else {
+				debuger.DPrintf("pid = %v, append to %v, reply = %v, args = %+v\n", rf.me, peer_id, reply, args)
 			}
 
 			rf.mu.Lock()
@@ -707,7 +778,6 @@ func (rf *Raft) appendPeer(leader_term int, peer_id int) {
 				break
 			}
 
-			debuger.DPrintf("pid = %v, append to %v, reply = %v\n", rf.me, peer_id, reply)
 			if !reply.Success {
 				if reply.Term > rf.term {
 					rf.term = reply.Term
@@ -716,6 +786,7 @@ func (rf *Raft) appendPeer(leader_term int, peer_id int) {
 					rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
 				} else {
 					rf.nextIndex[peer_id]--
+					debuger.DPrintf("pid = %v, append to %v not match, matchIndex = %v, nextIndex = %v\n", rf.me, peer_id, rf.matchIndex[peer_id], rf.nextIndex[peer_id])
 				}
 			} else {
 				// 更新nextIndex和matchIndex，和发送的保持一致
@@ -723,6 +794,7 @@ func (rf *Raft) appendPeer(leader_term int, peer_id int) {
 				rf.nextIndex[peer_id] = len(rf.log) + 1
 				debuger.DPrintf("pid = %v, append to %v success, matchIndex = %v, nextIndex = %v\n", rf.me, peer_id, rf.matchIndex[peer_id], rf.nextIndex[peer_id])
 			}
+			// rf.persist()
 			rf.mu.Unlock()
 		} else {
 			rf.mu.Unlock()
@@ -775,11 +847,13 @@ func (rf *Raft) startElection() bool {
 			isTimeout = true
 		case reply := <-rp_chan:
 			rf.mu.Lock()
+			needPersist := false
 			if reply.VoteGranted {
 				tickets++
 				if tickets >= len(rf.peers)/2 {
 					rf.status = Leader
-					debuger.DPrintf("pid = %v become leader\n", rf.me)
+					needPersist = true
+					debuger.DPrintf("pid = %v become leader, has logs = %v\n", rf.me, rf.log)
 				}
 			} else {
 				// check一下：减少后续判断
@@ -787,7 +861,11 @@ func (rf *Raft) startElection() bool {
 					rf.term = reply.Term
 					rf.status = Follower
 					rf.voted_id = -1
+					needPersist = true
 				}
+			}
+			if needPersist {
+				rf.persist()
 			}
 			rf.mu.Unlock()
 		default:
@@ -827,16 +905,19 @@ func (rf *Raft) sendHeartBeat(leader_term int) {
 
 				reply := AppendEntryReply{}
 				f := rf.sendAppendEntry(i, &args, &reply)
+				rf.mu.Lock()
 				if f {
-					rf.mu.Lock()
 					if reply.Term > rf.term {
 						rf.term = reply.Term
 						rf.status = Follower
 						rf.voted_id = -1
 						rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
+						rf.persist()
 					}
-					rf.mu.Unlock()
+				} else {
+					debuger.DPrintf("pid = %v, send heartbeat to %v, return = error, context = %+v, cur_term = %v, reply = %v\n", rf.me, i, args, rf.term, reply)
 				}
+				rf.mu.Unlock()
 			}(i)
 		}
 		rf.mu.Unlock()
@@ -869,7 +950,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		commitedIndex: 0,
 		lastApplied:   0,
 		// log_notifer:   make(chan struct{}, 100), // 多创建几个channel，提高性能，用于客户端通知有消息来
-		applyCh: applyCh,
+		applyCh:       applyCh,
+		emptyEntryNum: 0,
 	}
 	rf.client_notifier_cond = sync.NewCond(&rf.client_notifier_lock)
 
