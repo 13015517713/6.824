@@ -173,12 +173,12 @@ func (rf *Raft) persist() {
 	// rf.persister.Save(raftstate, nil)
 
 	// 存储当前raft状态，用于机器重启时回复
-	// var buffer bytes.Buffer
-	// encoder := labgob.NewEncoder(&buffer)
-	// encoder.Encode(rf.getPersistField())
-	// data := buffer.Bytes()
-	// // debuger.DPrintf("pid = %v, persist, rf = %v, len = %v\n", rf.me, rf.getPersistField(), len(data))
-	// rf.persister.Save(data, nil)
+	var buffer bytes.Buffer
+	encoder := labgob.NewEncoder(&buffer)
+	encoder.Encode(rf.getPersistField())
+	data := buffer.Bytes()
+	// debuger.DPrintf("pid = %v, persist, rf = %v, len = %v\n", rf.me, rf.getPersistField(), len(data))
+	rf.persister.Save(data, nil)
 }
 
 // restore previously persisted state.
@@ -504,6 +504,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term, index = rf.term, valid_cnt+1
 	rf.log = append(rf.log, E)
 	if isLeader {
+		rf.persist()
 		debuger.DPrintf("pid = %v handle client command = %v, index = %v, term = %v, logs = %v\n", rf.me, command, index, term, rf.log)
 	}
 
@@ -669,13 +670,10 @@ func (rf *Raft) checkApply() {
 			} else {
 				rf.emptyEntryNum++
 			}
-			debuger.DPrintf("pid = %v, applyMsg = %v, appliedlen = %v, hadcommitted = %v\n", rf.me, applyMsg, rf.lastApplied, rf.commitedIndex)
-			rf.mu.Unlock()
 
-			rf.mu.Lock()
+			debuger.DPrintf("pid = %v, applyMsg = %v, appliedlen = %v, hadcommitted = %v\n", rf.me, applyMsg, rf.lastApplied, rf.commitedIndex)
 			rf.persist()
 			rf.mu.Unlock()
-
 		} else {
 			rf.mu.Unlock()
 			time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond)
@@ -716,7 +714,7 @@ func (rf *Raft) checkCommit(leader_term int) {
 				}
 				if cnt >= len(rf.peers)/2+1 {
 					rf.commitedIndex = i
-					// rf.persist()
+					rf.persist()
 
 					debuger.DPrintf("pid = %v, commit entry = %v, index = %v\n", rf.me, rf.log[i-1], rf.commitedIndex)
 					break
@@ -741,7 +739,7 @@ func (rf *Raft) checkAppend(leader_term int) {
 }
 
 func (rf *Raft) appendPeer(leader_term int, peer_id int) {
-	for {
+	for !rf.killed() {
 		rf.mu.Lock()
 
 		if rf.status != Leader || rf.term != leader_term {
@@ -796,7 +794,7 @@ func (rf *Raft) appendPeer(leader_term int, peer_id int) {
 				rf.nextIndex[peer_id] = len(rf.log) + 1
 				debuger.DPrintf("pid = %v, append to %v success, matchIndex = %v, nextIndex = %v\n", rf.me, peer_id, rf.matchIndex[peer_id], rf.nextIndex[peer_id])
 			}
-			// rf.persist()
+			rf.persist()
 			rf.mu.Unlock()
 		} else {
 			rf.mu.Unlock()
@@ -882,7 +880,7 @@ func (rf *Raft) startElection() bool {
 }
 
 func (rf *Raft) sendHeartBeat(leader_term int) {
-	for {
+	for !rf.killed() {
 		rf.mu.Lock()
 		if rf.status != Leader || rf.term != leader_term {
 			rf.mu.Unlock()
