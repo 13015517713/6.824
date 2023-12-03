@@ -95,6 +95,7 @@ type Raft struct {
 
 	// cond notify checkcommit
 	commitCond *sync.Cond
+	needCheck  bool
 	appendCond *sync.Cond
 	applyCond  *sync.Cond
 }
@@ -348,12 +349,16 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 				}
 			}
 			if lastidx != 0 {
+				o_commit := rf.commitedIndex
 				if args.LeaderCommit > rf.commitedIndex {
 					if args.LeaderCommit > lastidx {
 						rf.commitedIndex = lastidx
 					} else {
 						rf.commitedIndex = args.LeaderCommit
 					}
+				}
+				if rf.commitedIndex > o_commit {
+					rf.applyCond.Signal() // 唤醒检查应用
 				}
 			}
 			debuger.DPrintf("pid = %v, lastidx = %v, leaderCommit = %v, commitedIndex = %v\n", rf.me, lastidx, args.LeaderCommit, rf.commitedIndex)
@@ -419,6 +424,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 					} else {
 						rf.commitedIndex = args.LeaderCommit
 					}
+					rf.applyCond.Signal() // 唤醒检查应用
 				}
 				needPersist = true
 			} else {
@@ -534,6 +540,7 @@ func (rf *Raft) Kill() {
 	// 唤醒检查
 	rf.commitCond.Signal()
 	rf.applyCond.Signal()
+	rf.appendCond.Signal()
 }
 
 func (rf *Raft) killed() bool {
@@ -641,14 +648,12 @@ func (rf *Raft) ticker() {
 			// 当append成功后，唤醒检查
 			// 当leader降级后，唤醒检查
 			rf.mu.Lock()
-			for !rf.killed() {
-				if rf.status == Leader && 
-				rf.commitCond.Wait()  // 存在问题
-				if rf.status == Leader {
-					rf.checkCommitOnce(leader_term)
-				} else {
-					break
+			for !rf.killed() && rf.status == Leader {
+				if rf.needCheck {
+					rf.checkCommitOnce(rf.term)
+					rf.needCheck = false
 				}
+				rf.commitCond.Wait()
 			}
 			rf.mu.Unlock()
 
@@ -663,7 +668,7 @@ func (rf *Raft) ticker() {
 	}
 }
 
-func (rf *Raft) checkApply() {
+func (rf *Raft) checkApplyOld() {
 	// 检查是否有新的entry可以commit
 	for !rf.killed() {
 
@@ -693,8 +698,37 @@ func (rf *Raft) checkApply() {
 	}
 }
 
-func (rf *Raft) checkApplyCond() {
+func (rf *Raft) checkApply() {
+	rf.mu.Lock()
+	for !rf.killed() {
+		if rf.lastApplied < rf.commitedIndex {
+			rf.checkApplyOnce()
+			rf.persist()
+		}
+		rf.applyCond.Wait()
+	}
+	rf.mu.Unlock()
+}
 
+func (rf *Raft) checkApplyOnce() {
+	// 检查是否有新的entry可以commit
+	for !rf.killed() && rf.lastApplied < rf.commitedIndex {
+		rf.lastApplied++
+		applyMsg := ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log[rf.lastApplied-1].Command,
+			CommandIndex: rf.lastApplied,
+		}
+
+		if applyMsg.Command != nil {
+			applyMsg.CommandIndex -= rf.emptyEntryNum
+			rf.applyCh <- applyMsg
+		} else {
+			rf.emptyEntryNum++
+		}
+
+		debuger.DPrintf("pid = %v, applyMsg = %v, appliedlen = %v, hadcommitted = %v\n", rf.me, applyMsg, rf.lastApplied, rf.commitedIndex)
+	}
 }
 
 func (rf *Raft) checkCommitOnce(leader_term int) {
@@ -711,6 +745,7 @@ func (rf *Raft) checkCommitOnce(leader_term int) {
 			}
 			if cnt >= len(rf.peers)/2+1 {
 				rf.commitedIndex = i
+				rf.applyCond.Signal() // 唤醒检查
 				break
 			}
 		}
@@ -791,6 +826,7 @@ func (rf *Raft) appendPeer(leader_term int, peer_id int) {
 				rf.matchIndex[peer_id] = rf.nextIndex[peer_id] + len(args.Entries) - 1
 				rf.nextIndex[peer_id] = len(rf.log) + 1
 				rf.commitCond.Signal()
+				rf.needCheck = true
 				debuger.DPrintf("pid = %v, append to %v success, matchIndex = %v, nextIndex = %v\n", rf.me, peer_id, rf.matchIndex[peer_id], rf.nextIndex[peer_id])
 			}
 			rf.persist()
