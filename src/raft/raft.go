@@ -254,12 +254,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// 不是你比我大,我就同意你.有可能脑裂,一边一直选举term更大.
 
 		if args.Term > rf.term {
+			if rf.status == Leader {
+				rf.commitCond.Signal()
+				rf.appendCond.Broadcast()
+			}
 			rf.term = args.Term
 			rf.status = Follower
 			rf.voted_id = -1
 			needPersist = true
-			rf.commitCond.Signal() // 降级也会唤醒
-			rf.appendCond.Signal() // 降级也会唤醒
 		}
 		if rf.status == Follower && rf.voted_id == -1 {
 			// 检查日志是否更新，否则不同意
@@ -325,14 +327,16 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			reply.Term = rf.term
 			reply.Success = false
 		} else {
+			if rf.term < args.Term {
+				rf.term = args.Term
+				if rf.status == Leader {
+					rf.commitCond.Signal()    // 降级也会唤醒
+					rf.appendCond.Broadcast() // 降级也会唤醒
+				}
+			}
 			rf.leaderId = args.LeaderId
 			rf.status = Follower
 			rf.voted_id = -1
-			if rf.term < args.Term {
-				rf.term = args.Term
-				rf.commitCond.Signal() // 降级也会唤醒
-				rf.appendCond.Signal() // 降级也会唤醒
-			}
 			rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
 			needPersist = true
 
@@ -372,12 +376,14 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			reply.Success = false
 		} else {
 			if args.Term > rf.term { // 我可能是个leader，变成follower直接开始work
+				if rf.status == Leader {
+					rf.commitCond.Signal()    // 降级也会唤醒
+					rf.appendCond.Broadcast() // 降级也会唤醒
+				}
 				rf.term = args.Term
 				rf.status = Follower
 				rf.voted_id = -1
 				needPersist = true
-				rf.commitCond.Signal() // 降级也会唤醒
-				rf.appendCond.Signal() // 降级也会唤醒
 			}
 			rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
 
@@ -518,7 +524,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term, index = rf.term, valid_cnt+1
 	rf.log = append(rf.log, E)
 	rf.persist()
-	rf.appendCond.Signal() // 唤醒检查
+	rf.appendCond.Broadcast() // 通知所有channel去发logs
 	rf.mu.Unlock()
 
 	return index, term, isLeader // 要不要考虑持久化呢。
@@ -540,12 +546,18 @@ func (rf *Raft) Kill() {
 	// 唤醒检查
 	rf.commitCond.Signal()
 	rf.applyCond.Signal()
-	rf.appendCond.Signal()
+	rf.appendCond.Broadcast()
 }
 
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
+}
+
+func (rf *Raft) notifyDown() {
+	rf.commitCond.Signal()
+	rf.applyCond.Signal()
+	rf.appendCond.Broadcast()
 }
 
 const (
@@ -765,16 +777,17 @@ func (rf *Raft) checkAppend(leader_term int) {
 }
 
 func (rf *Raft) appendPeer(leader_term int, peer_id int) {
+	checkPower := func() bool {
+		return !rf.killed() && rf.status == Leader && rf.term == leader_term
+	}
 	for {
 		rf.mu.Lock()
 
-		// 启动时唤醒
-		// 提交命令时唤醒
-		// 降级时唤醒
-		rf.appendCond.Wait() // 等待唤醒检查
+		for checkPower() && rf.nextIndex[peer_id] > len(rf.log) {
+			rf.appendCond.Wait()
+		}
 
-		if rf.killed() && rf.status != Leader || rf.term != leader_term {
-			debuger.DPrintf("pid = %v, is not leader when appending to %v\n", rf.me, peer_id)
+		if !checkPower() {
 			rf.mu.Unlock()
 			break
 		}
@@ -804,7 +817,7 @@ func (rf *Raft) appendPeer(leader_term int, peer_id int) {
 			}
 
 			rf.mu.Lock()
-			if rf.status != Leader || rf.term != leader_term {
+			if !checkPower() {
 				rf.mu.Unlock()
 				break
 			}
@@ -815,8 +828,8 @@ func (rf *Raft) appendPeer(leader_term int, peer_id int) {
 					rf.status = Follower
 					rf.voted_id = -1
 					rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
-					rf.commitCond.Signal() // 降级也会唤醒
-					rf.appendCond.Signal() // 降级也会唤醒
+					rf.commitCond.Signal()    // 降级也会唤醒
+					rf.appendCond.Broadcast() // 通知所有关闭
 				} else {
 					rf.nextIndex[peer_id] = reply.NextIndex
 					debuger.DPrintf("pid = %v, append to %v not match, matchIndex = %v, nextIndex = %v, reply = %+v\n", rf.me, peer_id, rf.matchIndex[peer_id], rf.nextIndex[peer_id], reply)
@@ -833,7 +846,6 @@ func (rf *Raft) appendPeer(leader_term int, peer_id int) {
 			rf.mu.Unlock()
 		} else {
 			rf.mu.Unlock()
-			time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond) // 批量检查提交
 		}
 	}
 }
@@ -948,8 +960,8 @@ func (rf *Raft) sendHeartBeat(leader_term int) {
 						rf.status = Follower
 						rf.voted_id = -1
 						rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
-						rf.commitCond.Signal() // 降级也会唤醒
-						rf.appendCond.Signal() // 降级也会唤醒
+						rf.commitCond.Signal()
+						rf.appendCond.Broadcast()
 						rf.persist()
 					}
 				}
@@ -990,6 +1002,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		emptyEntryNum: 0,
 	}
 	rf.commitCond = sync.NewCond(&rf.mu)
+	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.appendCond = sync.NewCond(&rf.mu)
 
 	// Your initialization code here (2A, 2B, 2C).
 	for i := 0; i < len(peers); i++ {
