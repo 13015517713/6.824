@@ -216,7 +216,7 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	// 副本状态机Index之前的都可以删除。快照保存下来
 }
 
 // example RequestVote RPC arguments structure.
@@ -554,12 +554,6 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) notifyDown() {
-	rf.commitCond.Signal()
-	rf.applyCond.Signal()
-	rf.appendCond.Broadcast()
-}
-
 const (
 	heartBeatInterval  int64 = 100
 	electInterval      int64 = 300
@@ -677,36 +671,6 @@ func (rf *Raft) ticker() {
 		// milliseconds.
 		// ms := 50 + (rand.Int63() % 300)
 		// time.Sleep(time.Duration(ms) * time.Millisecond)
-	}
-}
-
-func (rf *Raft) checkApplyOld() {
-	// 检查是否有新的entry可以commit
-	for !rf.killed() {
-
-		rf.mu.Lock()
-		if rf.lastApplied < rf.commitedIndex {
-			rf.lastApplied++
-			applyMsg := ApplyMsg{
-				CommandValid: true,
-				Command:      rf.log[rf.lastApplied-1].Command,
-				CommandIndex: rf.lastApplied,
-			}
-
-			if applyMsg.Command != nil {
-				applyMsg.CommandIndex -= rf.emptyEntryNum
-				rf.applyCh <- applyMsg
-			} else {
-				rf.emptyEntryNum++
-			}
-
-			debuger.DPrintf("pid = %v, applyMsg = %v, appliedlen = %v, hadcommitted = %v\n", rf.me, applyMsg, rf.lastApplied, rf.commitedIndex)
-			rf.persist()
-			rf.mu.Unlock()
-		} else {
-			rf.mu.Unlock()
-			time.Sleep(time.Duration(selectIdleInterval) * time.Millisecond)
-		}
 	}
 }
 
