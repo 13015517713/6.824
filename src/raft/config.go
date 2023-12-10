@@ -8,20 +8,24 @@ package raft
 // test with the original before submitting.
 //
 
-import "6.5840/labgob"
-import "6.5840/labrpc"
-import "bytes"
-import "log"
-import "sync"
-import "sync/atomic"
-import "testing"
-import "runtime"
-import "math/rand"
-import crand "crypto/rand"
-import "math/big"
-import "encoding/base64"
-import "time"
-import "fmt"
+import (
+	"bytes"
+	"log"
+	"math/rand"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"6.5840/labgob"
+	"6.5840/labrpc"
+
+	crand "crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"math/big"
+	"time"
+)
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
@@ -164,6 +168,7 @@ func (cfg *config) applier(i int, applyCh chan ApplyMsg) {
 			// ignore other types of ApplyMsg
 		} else {
 			cfg.mu.Lock()
+			DPrintf("wcx: server %v lock success\n", i)
 			err_msg, prevok := cfg.checkLogs(i, m)
 			cfg.mu.Unlock()
 			if m.CommandIndex > 1 && prevok == false {
@@ -203,6 +208,7 @@ func (cfg *config) ingestSnap(i int, snapshot []byte, index int) string {
 		cfg.logs[i][j] = xlog[j]
 	}
 	cfg.lastApplied[i] = lastIncludedIndex
+	DPrintf("wcx: server %v ingested snapshot up to index %v\n", i, lastIncludedIndex)
 	return ""
 }
 
@@ -219,8 +225,10 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 
 	for m := range applyCh {
 		err_msg := ""
+		DPrintf("wcx: server %v apply info = %v\n", i, m)
 		if m.SnapshotValid {
 			cfg.mu.Lock()
+			DPrintf("wcx: server %v ingesting snapshot up to index %v\n", i, m.SnapshotIndex)
 			err_msg = cfg.ingestSnap(i, m.Snapshot, m.SnapshotIndex)
 			cfg.mu.Unlock()
 		} else if m.CommandValid {
@@ -251,6 +259,7 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 					xlog = append(xlog, cfg.logs[i][j])
 				}
 				e.Encode(xlog)
+				DPrintf("wcx: server %v snnapshotting up to idex %v\n", i, m.CommandIndex)
 				rf.Snapshot(m.CommandIndex, w.Bytes())
 			}
 		} else {
@@ -262,6 +271,7 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 			// keep reading after error so that Raft doesn't block
 			// holding locks...
 		}
+		DPrintf("wcx: server %v apply info = %v end. \n", i, m)
 	}
 }
 
@@ -288,6 +298,7 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 	}
 
 	cfg.mu.Lock()
+	DPrintf("wcx: restart server %v lastApplied = %+v\n", i, cfg.lastApplied)
 
 	cfg.lastApplied[i] = 0
 
@@ -297,7 +308,7 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 	// pass Make() the last persisted state.
 	if cfg.saved[i] != nil {
 		cfg.saved[i] = cfg.saved[i].Copy()
-
+		// fmt.Printf("wcx: server %v saved[i] = %+v\n", i, cfg.saved[i])
 		snapshot := cfg.saved[i].ReadSnapshot()
 		if snapshot != nil && len(snapshot) > 0 {
 			// mimic KV server and process snapshot now.
@@ -320,6 +331,8 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 	cfg.mu.Lock()
 	cfg.rafts[i] = rf
 	cfg.mu.Unlock()
+
+	DPrintf("wcx: server %v starting, rf.state = %+v\n", i, rf)
 
 	go applier(i, applyCh)
 

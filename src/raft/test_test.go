@@ -8,12 +8,14 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -382,6 +384,7 @@ loop:
 				defer wg.Done()
 				i, term1, ok := cfg.rafts[leader].Start(100 + i)
 				if term1 != term {
+					// fmt.Printf("wcx: term changed while starting, term1 = %v, term = %v\n", term1, term)
 					return
 				}
 				if ok != true {
@@ -392,6 +395,7 @@ loop:
 		}
 
 		wg.Wait()
+		// fmt.Printf("wcx: try %v, term %v\n", try, term)
 		close(is)
 
 		for j := 0; j < servers; j++ {
@@ -1100,7 +1104,7 @@ const MAXLOGSIZE = 2000
 func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash bool) {
 	iters := 30
 	servers := 3
-	cfg := make_config(t, servers, !reliable, true)
+	cfg := make_config(t, servers, !reliable, true) // reliable false: rpc有延迟，有可能会超时
 	defer cfg.cleanup()
 
 	cfg.begin(name)
@@ -1122,6 +1126,7 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 		}
 		if crash {
 			cfg.crash1(victim)
+			DPrintf("TestSnapshotBasic2D: crashed %v\n", victim)
 			cfg.one(rand.Int(), servers-1, true)
 		}
 
@@ -1136,6 +1141,7 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 			// make sure all followers have caught up, so that
 			// an InstallSnapshot RPC isn't required for
 			// TestSnapshotBasic2D().
+			// fmt.Printf("TestSnapshotBasic2D: one for all\n")
 			cfg.one(rand.Int(), servers, true)
 		} else {
 			cfg.one(rand.Int(), servers-1, true)
@@ -1206,9 +1212,10 @@ func TestSnapshotAllCrash2D(t *testing.T) {
 
 		// crash all
 		for i := 0; i < servers; i++ {
-			cfg.crash1(i)
+			cfg.crash1(i) // 保存状态
 		}
 
+		DPrintf("wcx: TestSnapshotAllCrash2D: restart\n")
 		// revive all
 		for i := 0; i < servers; i++ {
 			cfg.start1(i, cfg.applierSnap)
