@@ -25,7 +25,7 @@ func (rf *Raft) initLeader() {
 		rf.nextIndex[i] = rf.getLastLogIndex() + 1
 		rf.matchIndex[i] = 0
 	}
-	// rf.appendEmptyForCatch()
+	// rf.appendEmptyForCatch()   // 在刚当选leader发空消息可以触发nextIndex的推进更新（否则其他节点不会更新）
 }
 
 func (rf *Raft) sendHeartBeat(leader_term int) {
@@ -36,31 +36,25 @@ func (rf *Raft) sendHeartBeat(leader_term int) {
 			break
 		}
 
+		args := AppendEntryArgs{
+			Term:         rf.term,
+			LeaderId:     rf.me,
+			LeaderCommit: rf.commitedIndex,
+			Entries:      []LogEntry{},
+		}
+
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
 				continue
 			}
 			go func(i int) {
-				rf.mu.Lock()
-				if !rf.checkPower(leader_term) {
-					rf.mu.Unlock()
-					return
-				}
-				args := AppendEntryArgs{}
-				args.Term = rf.term
-				args.LeaderId = rf.me
-				args.LeaderCommit = rf.commitedIndex
-				rf.mu.Unlock()
-
 				reply := AppendEntryReply{}
 				f := rf.sendAppendEntry(i, &args, &reply)
 				rf.mu.Lock()
 				if f {
 					if reply.Term > rf.term {
-						rf.term = reply.Term
-						rf.status = Follower
-						rf.voted_id = -1
-						rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
+						rf.meetBiggerTerm(reply.Term)
+						rf.aliveTime = time.Now().UnixNano() / int64(time.Millisecond)
 						rf.commitCond.Signal()
 						rf.appendCond.Broadcast()
 					}
@@ -183,10 +177,8 @@ func (rf *Raft) handleEntrys(peer_id int, leader_term int, args *AppendEntryArgs
 
 	if !reply.Success {
 		if reply.Term > rf.term {
-			rf.term = reply.Term
-			rf.status = Follower
-			rf.voted_id = -1
-			rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
+			rf.meetBiggerTerm(reply.Term)
+			rf.aliveTime = time.Now().UnixNano() / int64(time.Millisecond)
 			rf.commitCond.Signal()    // 降级也会唤醒
 			rf.appendCond.Broadcast() // 通知所有关闭
 		} else {
@@ -235,15 +227,12 @@ func (rf *Raft) handleSnapshot(peer_id int, leader_term int, args *InstallSnapsh
 			return
 		}
 		if reply.Term > rf.term {
-			rf.term = reply.Term
-			rf.status = Follower
-			rf.voted_id = -1
-			rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
+			rf.meetBiggerTerm(reply.Term)
+			rf.aliveTime = time.Now().UnixNano() / int64(time.Millisecond)
 			rf.commitCond.Signal()    // 降级也会唤醒
 			rf.appendCond.Broadcast() // 通知所有关闭
 		} else {
 			// 发送成功
-			// rf.nextIndex[peer_id] = rf.lastIncludedIndex + 1 // 发的可能是上一个snapshot，用现在的更新有问题的
 			rf.nextIndex[peer_id] = args.LastIncludedIndex + 1
 			rf.matchIndex[peer_id] = args.LastIncludedIndex
 			rf.commitCond.Signal()
@@ -283,7 +272,7 @@ func (rf *Raft) LeaderTick() {
 	rf.initLeader() // 心跳，检查commit，初始化NextIndex和MatchIndex
 
 	rf.mu.Lock()
-	for rf.live && rf.status == Leader { // 检查过killed，结果突然kill了，没接到信号。会一直等在这里。用mutex保护一个live
+	for rf.live && rf.status == Leader { // 如果用killed，在收到信号前结果突然kill了，没接到信号。会一直wait在这里。用mutex保护一个live
 		if rf.needCheck {
 			rf.checkCommitOnce(rf.term)
 			rf.needCheck = false

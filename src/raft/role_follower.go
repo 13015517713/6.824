@@ -33,10 +33,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	if args.Term > rf.term {
-		rf.term = args.Term
-		rf.status = Follower
-		rf.voted_id = -1
-		rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
+		rf.meetBiggerTerm(args.Term)
+		rf.aliveTime = time.Now().UnixNano() / int64(time.Millisecond)
 	}
 	reply.Term = rf.term
 
@@ -113,8 +111,8 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			}
 			rf.leaderId = args.LeaderId
 			rf.status = Follower
-			rf.voted_id = args.LeaderId // 防止同级在竞争的多次投票
-			rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
+			rf.votedId = args.LeaderId // 防止同级在竞争的多次投票
+			rf.aliveTime = time.Now().UnixNano() / int64(time.Millisecond)
 
 			reply.Success = true
 			reply.Term = args.Term
@@ -145,7 +143,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			debuger.DPrintf("pid = %v, update commitIndex = %v\n", rf.me, rf.commitedIndex)
 		}
 
-		debuger.DPrintf("pid = %v, receive heartbeat, leadId = %v, args.term = %v, rf.term = %v, alive_time = %v, cur_time = %v \n", rf.me, args.LeaderId, args.Term, rf.term, rf.alive_time, time.Now().UnixNano()/int64(time.Millisecond))
+		debuger.DPrintf("pid = %v, receive heartbeat, leadId = %v, args.term = %v, rf.term = %v, aliveTime = %v, cur_time = %v \n", rf.me, args.LeaderId, args.Term, rf.term, rf.aliveTime, time.Now().UnixNano()/int64(time.Millisecond))
 	} else { // append
 		if args.Term < rf.term {
 			reply.Term = rf.term
@@ -156,11 +154,9 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 					rf.commitCond.Signal()    // 降级也会唤醒
 					rf.appendCond.Broadcast() // 降级也会唤醒
 				}
-				rf.term = args.Term
-				rf.status = Follower
-				rf.voted_id = -1
+				rf.meetBiggerTerm(args.Term)
 			}
-			rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
+			rf.aliveTime = time.Now().UnixNano() / int64(time.Millisecond)
 
 			pre_match := -1
 			reply.Term = args.Term
@@ -228,7 +224,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			}
 
 		}
-		debuger.DPrintf("pid = %v receive append end, leadId = %v, args.term = %v, rf.term = %v, alive_time = %v, cur_time = %v \n", rf.me, args.LeaderId, args.Term, rf.term, rf.alive_time, time.Now().UnixNano()/int64(time.Millisecond))
+		debuger.DPrintf("pid = %v receive append end, leadId = %v, args.term = %v, rf.term = %v, aliveTime = %v, cur_time = %v \n", rf.me, args.LeaderId, args.Term, rf.term, rf.aliveTime, time.Now().UnixNano()/int64(time.Millisecond))
 	}
 }
 
@@ -238,7 +234,7 @@ func (rf *Raft) FollowerTick() {
 	for rf.live {
 
 		t := time.Now().UnixNano() / int64(time.Millisecond)
-		a := rf.alive_time
+		a := rf.aliveTime
 		debuger.DPrintf("pid = %v, t = %v, a = %v, r = %v, interval = %v\n", rf.me, t, a, electInterval, t-a)
 
 		if t-a < electInterval {
@@ -249,7 +245,7 @@ func (rf *Raft) FollowerTick() {
 		} else {
 			rf.term++
 			rf.status = Candidate
-			rf.voted_id = rf.me
+			rf.votedId = rf.me
 			debuger.DPrintf("pid = %v become candidate\n", rf.me)
 			return
 		}

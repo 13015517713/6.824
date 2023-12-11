@@ -6,6 +6,13 @@ import (
 	debuger "6.5840/helper"
 )
 
+func (rf *Raft) meetBiggerTerm(term int) {
+	Assert(term > rf.term, "not bigger term")
+	rf.term = term
+	rf.votedId = -1
+	rf.status = Follower
+}
+
 func (rf *Raft) submitApply() {
 	for !rf.killed() {
 		rf.applyLock.Lock()
@@ -36,28 +43,37 @@ func (rf *Raft) checkApply() {
 			return
 		}
 
+		rf.lastApplied++
 		debuger.DPrintf("pid = %v, ready to apply index = %v, loglen = %v", rf.me, rf.lastApplied, len(rf.log))
 		f, idx := rf.findInLogs(rf.lastApplied)
 		Assert(f, "checkApplyOnce search index error")
 		Assert(rf.log[idx].Index == rf.lastApplied, "checkApplyOnce search index error")
 
 		applyMsgList := []ApplyMsg{}
-		for rf.lastApplied < rf.commitedIndex {
-			rf.lastApplied++ // 可以把commit的全都放到发送队列中
-			idx++
+		for {
 			applyMsgList = append(applyMsgList, ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log[idx].Command,
 				CommandIndex: rf.lastApplied,
 			})
+
+			if rf.lastApplied < rf.commitedIndex {
+				rf.lastApplied++ // 可以把commit的全都放到发送队列中
+				idx++
+			} else {
+				break
+			}
+
 			debuger.DPrintf("pid = %v, ready to apply success index = %v, loglen = %v", rf.me, rf.lastApplied, len(rf.log))
 		}
+
 		rf.applyLock.Lock()
 		rf.applyList = append(rf.applyList, applyMsgList...)
 		rf.applyLock.Unlock()
 
 		debuger.DPrintf("pid = %v, applyMsg = %v, appliedlen = %v, hadcommitted = %v\n", rf.me, applyMsgList, rf.lastApplied, rf.commitedIndex)
 		rf.mu.Unlock() // 一直占用锁，可能导致重新选举; sleep一段时间再触发
+
 		time.Sleep(time.Duration(applyInterval) * time.Microsecond)
 	}
 }

@@ -45,17 +45,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				rf.commitCond.Signal()
 				rf.appendCond.Broadcast()
 			}
-			rf.term = args.Term
-			rf.status = Follower
-			rf.voted_id = -1
+			rf.meetBiggerTerm(args.Term)
 		}
-		if rf.status == Follower && rf.voted_id == -1 {
+		if rf.status == Follower && rf.votedId == -1 {
 			// 检查日志是否更新，否则不同意
 			local_idx := rf.getLastLogIndex()
 			local_term := rf.getLastLogTerm()
 			if args.LastLogTerm > local_term || (args.LastLogTerm == local_term && args.LastLogIdx >= local_idx) {
-				rf.alive_time = time.Now().UnixNano() / int64(time.Millisecond)
-				rf.voted_id = args.CandidateId
+				rf.aliveTime = time.Now().UnixNano() / int64(time.Millisecond)
+				rf.votedId = args.CandidateId
 				reply.VoteGranted = true
 				needPersist = true
 			} else {
@@ -133,9 +131,7 @@ func (rf *Raft) startElection() bool {
 				}
 			} else {
 				if reply.Term > rf.term {
-					rf.term = reply.Term
-					rf.status = Follower
-					rf.voted_id = -1
+					rf.meetBiggerTerm(reply.Term)
 					rf.mu.Unlock()
 					return false
 				}
@@ -160,7 +156,7 @@ func (rf *Raft) CandidateTick() {
 			return
 		}
 		rf.term += 1
-		rf.voted_id = rf.me
+		rf.votedId = rf.me
 		rf.mu.Unlock()
 		debuger.DPrintf("pid = %v elect failes\n", rf.me)
 	}

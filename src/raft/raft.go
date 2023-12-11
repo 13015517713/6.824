@@ -96,11 +96,11 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	term       int
-	status     RaftStatus
-	leaderId   int
-	voted_id   int
-	alive_time int64 // 心跳时间
+	term      int
+	status    RaftStatus
+	leaderId  int // 这里用驼峰有点特殊
+	votedId   int
+	aliveTime int64 // 心跳时间
 
 	// for all servers
 	log           []LogEntry
@@ -158,9 +158,9 @@ func (rf *Raft) findInLogs(index int) (bool, int) {
 
 // 需要持久化的raft变量
 type RaftPersist struct {
-	Me       int
-	Term     int
-	Voted_id int
+	Me      int
+	Term    int
+	VotedId int
 
 	Log []LogEntry
 
@@ -171,9 +171,9 @@ type RaftPersist struct {
 
 func (rf *Raft) getPersistField() RaftPersist {
 	return RaftPersist{
-		Me:       rf.me,
-		Term:     rf.term,
-		Voted_id: rf.voted_id,
+		Me:      rf.me,
+		Term:    rf.term,
+		VotedId: rf.votedId,
 
 		Log: rf.log,
 
@@ -185,7 +185,7 @@ func (rf *Raft) getPersistField() RaftPersist {
 func (rf *Raft) setPersistField(r *RaftPersist) {
 	rf.me = r.Me
 	rf.term = r.Term
-	rf.voted_id = r.Voted_id // 防止一个任期内多次投票
+	rf.votedId = r.VotedId // 防止一个任期内多次投票
 
 	rf.log = r.Log // 为了投票时的判定
 
@@ -354,8 +354,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		me:                me,
 		term:              0,
 		status:            Follower,
-		alive_time:        time.Now().UnixNano() / int64(time.Millisecond),
-		voted_id:          -1,
+		aliveTime:         time.Now().UnixNano() / int64(time.Millisecond),
+		votedId:           -1,
 		commitedIndex:     0,
 		lastApplied:       0,
 		applyCh:           applyCh,
