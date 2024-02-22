@@ -1,9 +1,12 @@
 package kvraft
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongLeader = "ErrWrongLeader"
+	OK               = "OK"
+	ErrNotRunning    = "ErrNotRunning"
+	ErrNoKey         = "ErrNoKey"
+	ErrWrongLeader   = "ErrWrongLeader"
+	ErrCommitFail    = "ErrCommitFail"
+	ErrCommitTimeout = "ErrCommitTimeout"
 )
 
 type Err string
@@ -30,4 +33,11 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+// helper
+func Assert(f bool, msg string) {
+	if !f {
+		panic(msg)
+	}
 }
