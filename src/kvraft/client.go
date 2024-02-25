@@ -14,6 +14,7 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	knownLeader int
+	id          int64
 }
 
 func nrand() int64 {
@@ -27,6 +28,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	ck.knownLeader = 0
+	ck.id = nrand()
 	// You'll have to add code here.
 	return ck
 }
@@ -42,30 +44,56 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
-	req := GetArgs{Key: key}
-	reply := GetReply{}
-	for {
+	res, _ := ck.GetTmp(key)
+	// fmt.Printf("CLIENT: id %v return get key:%v, value:%v, index:%v\n", ck.id, key, res, index)
+	return res
+}
+func (ck *Clerk) GetTmp(key string) (string, int) {
+
+	baseReq := GetArgs{Key: key, ReqId: ReqIdentity{UUID: newUUID()}}
+	baseReply := GetReply{}
+	// DPrintf("CLIENT: clerk call get key:%v, reqId:%+v", key, baseReq.ReqId)
+
+	for { // 无限尝试
 		ck.mu.Lock()
 		knownLeader := ck.knownLeader
 		ck.mu.Unlock()
-		for i := 0; i < len(ck.servers); i++ {
-			f := ck.servers[(i+knownLeader)%len(ck.servers)].Call("KVServer.Get", &req, &reply)
-			if f && reply.Err == OK {
-				DPrintf("Get success. key:%v info on server %v: %v", key, i, reply)
+
+		i := 0
+		for i < len(ck.servers) {
+			req, reply := baseReq, baseReply
+			curServerId := (i + knownLeader) % len(ck.servers)
+			f := ck.servers[curServerId].Call("KVServer.Get", &req, &reply)
+			if !f {
+				i++
+				continue
+			}
+
+			switch reply.Err {
+			case OK, ErrDupRequest:
 				if i != 0 {
 					ck.mu.Lock()
-					ck.knownLeader = (i + knownLeader) % len(ck.servers)
+					ck.knownLeader = curServerId
 					ck.mu.Unlock()
 				}
-				return reply.Value
+				// DPrintf("CLIENT: Get success. key:%v info on server %v: %+v", key, curServerId, reply)
+				return reply.Value, reply.Index
+			case ErrNotRunning, ErrWrongLeader:
+			case ErrNoKey:
+				return "", -1
+			case ErrCommitFail, ErrCommitTimeout:
+				// DPrintf("CLIENT: Get fail, commitfail or timeout. key:%v info on server %v: %+v", key, curServerId, reply.Err)
 			}
-			DPrintf("Get fail. key:%v info on server %v: %v", key, i, reply)
+			// case ErrCommitTimeout:
+			// 	// maybe 还是Leader，也可能是网络分区了，暂时重试其他的服务器
+
+			i++
+
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 
-	// You will have to modify this function.
-	return ""
+	return "", -1
 }
 
 // shared by Put and Append.
@@ -77,27 +105,60 @@ func (ck *Clerk) Get(key string) string {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
+	ck.PutAppendTmp(key, value, op)
+	// fmt.Printf("CLIENT: id %v return put key:%v, value:%v, index:%v\n", ck.id, key, value, index)
+}
+func (ck *Clerk) PutAppendTmp(key string, value string, op string) int {
 	// You will have to modify this function.
-	req := PutAppendArgs{Key: key, Value: value, Op: op}
-	reply := PutAppendReply{}
-	for {
+	// var req PutAppendArgs
+	// var reply PutAppendReply
+	baseReq := PutAppendArgs{Key: key, Value: value, Op: op, ReqId: ReqIdentity{UUID: newUUID()}}
+	baseReply := PutAppendReply{}
+
+	for { // 无限尝试
 		ck.mu.Lock()
 		knownLeader := ck.knownLeader
 		ck.mu.Unlock()
-		for i := 0; i < len(ck.servers); i++ {
-			f := ck.servers[(i+knownLeader)%len(ck.servers)].Call("KVServer.PutAppend", &req, &reply)
-			if f && reply.Err == OK {
-				DPrintf("Put success. info %+v on server %v: %v", req, i, reply)
+
+		i := 0
+		for i < len(ck.servers) {
+			req, reply := baseReq, baseReply
+			curServerId := (i + knownLeader) % len(ck.servers)
+			f := ck.servers[curServerId].Call("KVServer.PutAppend", &req, &reply)
+			if !f {
+				i++
+				continue
+			}
+
+			// if op == "Put" {
+			// 	DPrintf("CLIENT: issue put key:%v value:%v on server %v: %+v, reqId:%v", key, value, curServerId, reply, req.ReqId)
+			// } else {
+			// 	DPrintf("CLIENT: issue append key:%v value:%v on server %v: %+v, reqId:%v", key, value, curServerId, reply, req.ReqId)
+			// }
+
+			switch reply.Err {
+			case OK, ErrDupRequest:
 				if i != 0 {
 					ck.mu.Lock()
-					ck.knownLeader = (i + knownLeader) % len(ck.servers)
+					ck.knownLeader = curServerId
 					ck.mu.Unlock()
 				}
-				return
+				// DPrintf("CLIENT: Put success. key:%v info on server %v: %+v", key, curServerId, reply)
+				return reply.Index
+			case ErrNotRunning, ErrWrongLeader:
+			case ErrCommitFail, ErrCommitTimeout:
+				// DPrintf("CLIENT: Put fail: commitfail or timeout. key:%v info on server %v: %+v", key, curServerId, reply.Err)
+			default:
+				Assert(false, "PutAppend fail, unknown error")
 			}
-			DPrintf("Put fail. info %+v on server %v: %v", req, i, reply)
+			// case ErrCommitTimeout:
+			// 	// maybe 还是Leader，也可能是网络分区了，暂时重试其他的服务器
+
+			i++
+
+			// DPrintf("Get fail. key:%v info on server %v: %v", key, i, reply)
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

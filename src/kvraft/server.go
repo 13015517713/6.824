@@ -1,7 +1,6 @@
 package kvraft
 
 import (
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,18 +10,12 @@ import (
 	"6.5840/raft"
 )
 
-const Debug = true
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
-	}
-	return
-}
-
 const (
 	// ms
-	waitCommitTimeout = 1000
+	waitCommitTimeout   = 1000
+	checkLeaderInterval = 10
+	// us
+	applyInterval = 100
 )
 
 type OpType int
@@ -43,15 +36,17 @@ type Op struct {
 }
 
 type Command struct {
-	Op        Op
-	LaunchId  int
-	LaunchSeq uint64
+	Op       Op
+	LaunchId int
+	ReqId    ReqIdentity
 }
 
 type Result struct {
 	Key string
 	Val string
 	Err Err
+
+	Index int
 }
 
 type KVServer struct {
@@ -64,9 +59,11 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	dataImpl *KVStore
-	opChans  map[uint64]chan Result
-	cmdSeq   uint64
+	dataImpl     *KVStore
+	opChans      map[ReqIdentity]chan Result
+	cmdSeq       uint64
+	opHistory    map[ReqIdentity]Result
+	appliedIndex int
 }
 
 func (kv *KVServer) doOp(op Op) Result {
@@ -81,11 +78,19 @@ func (kv *KVServer) doOp(op Op) Result {
 			res = Result{Key: op.Key, Val: val, Err: OK}
 		}
 	case OpTypePut:
+		oldVal, _ := kv.dataImpl.Get(op.Key)
 		kv.dataImpl.Put(op.Key, op.Value)
 		res = Result{Err: OK}
+		curVal, _ := kv.dataImpl.Get(op.Key)
+		DPrintf("RSM: kvserver %v append key %v value %v, old val %v, cur value %v", kv.me, op.Key, op.Value, oldVal, curVal)
+		res = Result{Key: op.Key, Val: op.Value, Err: OK}
 	case OpTypeAppend:
+		oldVal, _ := kv.dataImpl.Get(op.Key)
 		kv.dataImpl.Append(op.Key, op.Value)
-		res = Result{Err: OK}
+		curVal, _ := kv.dataImpl.Get(op.Key)
+		DPrintf("RSM: kvserver %v append key %v value %v, old val %v, cur value %v", kv.me, op.Key, op.Value, oldVal, curVal)
+		// res = Result{Err: OK}
+		res = Result{Key: op.Key, Val: curVal, Err: OK}
 	default:
 		Assert(false, "doOp: unknown op type")
 	}
@@ -93,70 +98,141 @@ func (kv *KVServer) doOp(op Op) Result {
 	return res
 }
 
+// func checkTimeoutChannel(f func()) bool {
+// 	timer := time.After(time.Duration(waitCommitTimeout) * 3 * time.Millisecond)
+// 	done := make(chan struct{})
+// 	go func(c chan struct{}) {
+// 		f()
+// 		c <- struct{}{}
+// 	}(done)
+// 	select {
+// 	case <-done:
+// 		return true
+// 	case <-timer:
+// 		return false
+// 		// Assert(false, "checkTimeoutChannel: timeout")
+// 	}
+
+// }
+
 // RSM，读取applyCh，针对执行信息返回
 func (kv *KVServer) readApply() {
 	for {
 		applyMsg := <-kv.applyCh
-		_, cmd := applyMsg.CommandIndex, applyMsg.Command.(Command)
+		index, cmd := applyMsg.CommandIndex, applyMsg.Command.(Command)
 
-		res := kv.doOp(cmd.Op)
+		curReqId := cmd.ReqId
+		kv.mu.Lock()
+		if res, ok := kv.opHistory[curReqId]; ok {
 
-		if cmd.LaunchId != kv.me {
+			if cmd.LaunchId != kv.me {
+				kv.mu.Unlock()
+				continue
+			}
+
+			if resChan, f := kv.opChans[cmd.ReqId]; f {
+				res.Err = ErrDupRequest
+				resChan <- res
+			}
+
+			kv.mu.Unlock()
+
 			continue
 		}
+		kv.mu.Unlock()
 
-		kv.opChans[cmd.LaunchSeq] <- res
-		DPrintf("KVServer %v apply index %v, cmd %+v, res %+v", kv.me, applyMsg.CommandIndex, cmd, res)
+		res := kv.doOp(cmd.Op)
+		res.Index = index
+		// fmt.Printf("OP: KVServer %v doOp cmd:%+v, index:%v, res:%+v\n", kv.me, cmd, index, res)
+
+		kv.mu.Lock()
+
+		kv.opHistory[curReqId] = res
+		// DPrintf("APPLY: KVServer %v add history index %v, reqId:%v, launchSeq:%v, appliedIndex:%v, historyLen:%v", kv.me, applyMsg.CommandIndex, cmd.ReqId, cmd.LaunchSeq, kv.appliedIndex, len(kv.opHistory))
+
+		if cmd.LaunchId == kv.me {
+			if resChan, f := kv.opChans[cmd.ReqId]; f {
+				resChan <- res
+			}
+		}
+		kv.mu.Unlock()
+
+	}
+}
+
+func (kv *KVServer) GetDupRes(req ReqIdentity) (Result, bool) {
+	if res, ok := kv.opHistory[req]; ok {
+		return res, true
+	} else {
+		return Result{}, false
 	}
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	// DPrintf("Server: %v get func: key: %v, reqId:%v", kv.me, args.Key, args.ReqId)
 	if kv.killed() {
 		reply.Err = ErrNotRunning
 		return
 	}
 
 	kv.mu.Lock()
-
-	// 调用start，如果是leader
-	cmd := Command{
-		Op:        Op{Type: OpTypeGet, Key: args.Key},
-		LaunchId:  kv.me,
-		LaunchSeq: kv.cmdSeq,
-	}
-	kv.opChans[cmd.LaunchSeq] = make(chan Result, 1)
-	kv.cmdSeq++
-
-	_, _, isLeader := kv.rf.Start(cmd)
-	if !isLeader {
+	if res, ok := kv.GetDupRes(args.ReqId); ok {
+		reply.Err = ErrDupRequest
+		reply.Value = res.Val
 		kv.mu.Unlock()
+		return
+	}
+
+	cmd := Command{
+		Op:       Op{Type: OpTypeGet, Key: args.Key},
+		LaunchId: kv.me,
+		ReqId:    args.ReqId,
+	}
+
+	resChan := make(chan Result, 1)
+	kv.opChans[cmd.ReqId] = resChan
+	kv.mu.Unlock()
+
+	defer func() {
+		kv.mu.Lock()
+		close(resChan)
+		delete(kv.opChans, cmd.ReqId)
+		kv.mu.Unlock()
+	}()
+
+	_, term, isLeader := kv.rf.Start(cmd)
+	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
 
-	kv.mu.Unlock()
+	// DPrintf("Server: %v get func as leader: key: %v, reqId:%v, index:%v, launchSeq:%v", kv.me, args.Key, args.ReqId, index, cmd.LaunchSeq)
 
 	timer := time.After(time.Duration(waitCommitTimeout) * time.Millisecond)
+	checkTimer := time.After(time.Duration(checkLeaderInterval) * time.Millisecond)
 	for {
 		select {
 		case <-timer:
 			reply.Err = ErrCommitTimeout
-			DPrintf("Get timeout")
+			// DPrintf("Server: %v get timeout waiting commit, cmd:%+v", kv.me, cmd)
 			return
-		case res := <-kv.opChans[cmd.LaunchSeq]:
-			if res.Err == OK {
-				close(kv.opChans[cmd.LaunchSeq])
-				delete(kv.opChans, cmd.LaunchSeq)
-				reply.Err = OK
+		case res := <-resChan:
+			reply.Err = res.Err
+			reply.Index = res.Index
+			if res.Err == OK || res.Err == ErrDupRequest {
 				reply.Value = res.Val
-			} else {
-				reply.Err = res.Err
+				// DPrintf("Server: %v get return key: %v, reply: %+v", kv.me, args.Key, reply.Err)
 			}
+			Assert(res.Err == OK || res.Err == ErrDupRequest || res.Err == ErrNoKey, "Get: res return but not OK or ErrDupRequest or ErrNoKey")
 			return
-			// 如果已经不是Leader了。返回让client re-send
-			// default:
-			// 判断当前是否是leader
+		case <-checkTimer:
+			curTerm, curIsLeader := kv.rf.GetState()
+			if curTerm != term || !curIsLeader {
+				reply.Err = ErrCommitFail
+				return
+			}
+			checkTimer = time.After(time.Duration(checkLeaderInterval) * time.Millisecond)
 		}
 	}
 
@@ -164,14 +240,20 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	DPrintf("Server: %v put func: key: %v, reqId:%v", kv.me, args.Key, args.ReqId)
+
 	if kv.killed() {
 		reply.Err = ErrNotRunning
 		return
 	}
 
 	kv.mu.Lock()
+	if _, ok := kv.GetDupRes(args.ReqId); ok {
+		reply.Err = ErrDupRequest
+		kv.mu.Unlock()
+		return
+	}
 
-	// 调用start，如果是leader
 	var optype OpType
 	if args.Op == "Put" {
 		optype = OpTypePut
@@ -179,34 +261,53 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		optype = OpTypeAppend
 	}
 	cmd := Command{
-		Op:        Op{Type: optype, Key: args.Key, Value: args.Value},
-		LaunchId:  kv.me,
-		LaunchSeq: kv.cmdSeq,
+		Op:       Op{Type: optype, Key: args.Key, Value: args.Value},
+		LaunchId: kv.me,
+		ReqId:    args.ReqId,
 	}
-	kv.opChans[cmd.LaunchSeq] = make(chan Result, 1)
-	kv.cmdSeq++
 
-	_, _, isLeader := kv.rf.Start(cmd)
-	if !isLeader {
+	resChan := make(chan Result, 1)
+	kv.opChans[cmd.ReqId] = resChan
+	kv.mu.Unlock()
+
+	defer func() {
+		kv.mu.Lock()
+		close(resChan)
+		delete(kv.opChans, cmd.ReqId)
 		kv.mu.Unlock()
+	}()
+
+	_, term, isLeader := kv.rf.Start(cmd)
+	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
 
-	kv.mu.Unlock()
+	// DPrintf("Server: %v put func as leader: key: %v, reqId:%v, index:%v, launchSeq:%v", kv.me, args.Key, args.ReqId, index, cmd.LaunchSeq)
 
 	timer := time.After(time.Duration(waitCommitTimeout) * time.Millisecond)
+	checkTimer := time.After(time.Duration(checkLeaderInterval) * time.Millisecond)
 	for {
 		select {
 		case <-timer:
 			reply.Err = ErrCommitTimeout
-			DPrintf("Get timeout")
+			DPrintf("Server: %v put timeout waiting commit", kv.me)
 			return
-		case res := <-kv.opChans[cmd.LaunchSeq]:
+		case res := <-resChan:
 			reply.Err = res.Err
-			close(kv.opChans[cmd.LaunchSeq])
-			delete(kv.opChans, cmd.LaunchSeq)
+			reply.Index = res.Index
+			// if res.Err == OK || res.Err == ErrDupRequest {
+			// 	DPrintf("Server: %v put return key: %v, reply: %+v", kv.me, args.Key, reply.Err)
+			// }
+			Assert(res.Err == OK || res.Err == ErrDupRequest, "PutAppend: res.Err")
 			return
+		case <-checkTimer:
+			curTerm, curIsLeader := kv.rf.GetState()
+			if curTerm != term || !curIsLeader {
+				reply.Err = ErrCommitFail
+				return
+			}
+			checkTimer = time.After(time.Duration(checkLeaderInterval) * time.Millisecond)
 		}
 	}
 
@@ -253,12 +354,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 	kv.dataImpl = NewKVStore()
 	kv.cmdSeq = 0
+	kv.appliedIndex = -1
 
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.opChans = make(map[uint64]chan Result)
+	kv.opChans = make(map[ReqIdentity]chan Result)
+	kv.opHistory = make(map[ReqIdentity]Result)
+	DPrintf("KVServer %v restart", me)
 
 	// You may need initialization code here.
 	go kv.readApply()
