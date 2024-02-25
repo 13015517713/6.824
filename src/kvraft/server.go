@@ -59,11 +59,9 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	dataImpl     *KVStore
-	opChans      map[ReqIdentity]chan Result
-	cmdSeq       uint64
-	opHistory    map[ReqIdentity]Result
-	appliedIndex int
+	dataImpl  *KVStore
+	opChans   map[ReqIdentity]chan Result // 客户端等待结果的channel
+	opHistory map[ReqIdentity]Result      // 执行历史
 }
 
 func (kv *KVServer) doOp(op Op) Result {
@@ -136,7 +134,6 @@ func (kv *KVServer) readApply() {
 			}
 
 			kv.mu.Unlock()
-
 			continue
 		}
 		kv.mu.Unlock()
@@ -189,28 +186,25 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		LaunchId: kv.me,
 		ReqId:    args.ReqId,
 	}
+	index, term, isLeader := kv.rf.Start(cmd)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
 
 	resChan := make(chan Result, 1)
 	kv.opChans[cmd.ReqId] = resChan
-	kv.mu.Unlock()
-
 	defer func() {
 		kv.mu.Lock()
 		close(resChan)
 		delete(kv.opChans, cmd.ReqId)
 		kv.mu.Unlock()
 	}()
+	kv.mu.Unlock()
 
-	_, term, isLeader := kv.rf.Start(cmd)
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
-	}
-
-	// DPrintf("Server: %v get func as leader: key: %v, reqId:%v, index:%v, launchSeq:%v", kv.me, args.Key, args.ReqId, index, cmd.LaunchSeq)
-
+	DPrintf("Server: %v get func as leader: key: %v, reqId:%v, index:%v", kv.me, args.Key, args.ReqId, index)
 	timer := time.After(time.Duration(waitCommitTimeout) * time.Millisecond)
-	checkTimer := time.After(time.Duration(checkLeaderInterval) * time.Millisecond)
 	for {
 		select {
 		case <-timer:
@@ -226,13 +220,12 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			}
 			Assert(res.Err == OK || res.Err == ErrDupRequest || res.Err == ErrNoKey, "Get: res return but not OK or ErrDupRequest or ErrNoKey")
 			return
-		case <-checkTimer:
+		case <-time.After(time.Duration(checkLeaderInterval) * time.Millisecond):
 			curTerm, curIsLeader := kv.rf.GetState()
 			if curTerm != term || !curIsLeader {
 				reply.Err = ErrCommitFail
 				return
 			}
-			checkTimer = time.After(time.Duration(checkLeaderInterval) * time.Millisecond)
 		}
 	}
 
@@ -240,8 +233,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	DPrintf("Server: %v put func: key: %v, reqId:%v", kv.me, args.Key, args.ReqId)
-
 	if kv.killed() {
 		reply.Err = ErrNotRunning
 		return
@@ -260,16 +251,24 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	} else if args.Op == "Append" {
 		optype = OpTypeAppend
 	}
+
 	cmd := Command{
 		Op:       Op{Type: optype, Key: args.Key, Value: args.Value},
 		LaunchId: kv.me,
 		ReqId:    args.ReqId,
 	}
 
+	index, term, isLeader := kv.rf.Start(cmd)
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+
+	// DPrintf("Server: %v put func as leader: key: %v, reqId:%v, index:%v", kv.me, args.Key, args.ReqId, index)
 	resChan := make(chan Result, 1)
 	kv.opChans[cmd.ReqId] = resChan
-	kv.mu.Unlock()
-
 	defer func() {
 		kv.mu.Lock()
 		close(resChan)
@@ -277,16 +276,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.mu.Unlock()
 	}()
 
-	_, term, isLeader := kv.rf.Start(cmd)
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
-	}
+	kv.mu.Unlock()
 
-	// DPrintf("Server: %v put func as leader: key: %v, reqId:%v, index:%v, launchSeq:%v", kv.me, args.Key, args.ReqId, index, cmd.LaunchSeq)
+	DPrintf("Server: %v put func as leader: key: %v, reqId:%v, index:%v", kv.me, args.Key, args.ReqId, index)
 
 	timer := time.After(time.Duration(waitCommitTimeout) * time.Millisecond)
-	checkTimer := time.After(time.Duration(checkLeaderInterval) * time.Millisecond)
 	for {
 		select {
 		case <-timer:
@@ -296,18 +290,14 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		case res := <-resChan:
 			reply.Err = res.Err
 			reply.Index = res.Index
-			// if res.Err == OK || res.Err == ErrDupRequest {
-			// 	DPrintf("Server: %v put return key: %v, reply: %+v", kv.me, args.Key, reply.Err)
-			// }
 			Assert(res.Err == OK || res.Err == ErrDupRequest, "PutAppend: res.Err")
 			return
-		case <-checkTimer:
+		case <-time.After(time.Duration(checkLeaderInterval) * time.Millisecond):
 			curTerm, curIsLeader := kv.rf.GetState()
 			if curTerm != term || !curIsLeader {
 				reply.Err = ErrCommitFail
 				return
 			}
-			checkTimer = time.After(time.Duration(checkLeaderInterval) * time.Millisecond)
 		}
 	}
 
@@ -353,8 +343,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 	kv.dataImpl = NewKVStore()
-	kv.cmdSeq = 0
-	kv.appliedIndex = -1
 
 	// You may need initialization code here.
 

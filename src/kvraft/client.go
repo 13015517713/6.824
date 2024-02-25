@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"math/big"
 	"sync"
-	"time"
 
 	"6.5840/labrpc"
 )
@@ -13,8 +12,8 @@ type Clerk struct {
 	mu      sync.Mutex
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	knownLeader int
-	id          int64
+	knownLeader       int
+	knownLeaderRWLock sync.RWMutex
 }
 
 func nrand() int64 {
@@ -28,7 +27,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	ck.knownLeader = 0
-	ck.id = nrand()
+
 	// You'll have to add code here.
 	return ck
 }
@@ -48,16 +47,16 @@ func (ck *Clerk) Get(key string) string {
 	// fmt.Printf("CLIENT: id %v return get key:%v, value:%v, index:%v\n", ck.id, key, res, index)
 	return res
 }
-func (ck *Clerk) GetTmp(key string) (string, int) {
 
+func (ck *Clerk) GetTmp(key string) (string, int) {
 	baseReq := GetArgs{Key: key, ReqId: ReqIdentity{UUID: newUUID()}}
 	baseReply := GetReply{}
-	// DPrintf("CLIENT: clerk call get key:%v, reqId:%+v", key, baseReq.ReqId)
+	DPrintf("CLIENT: clerk call get key:%v", key)
 
 	for { // 无限尝试
-		ck.mu.Lock()
+		ck.knownLeaderRWLock.RLock()
 		knownLeader := ck.knownLeader
-		ck.mu.Unlock()
+		ck.knownLeaderRWLock.RUnlock()
 
 		i := 0
 		for i < len(ck.servers) {
@@ -69,31 +68,29 @@ func (ck *Clerk) GetTmp(key string) (string, int) {
 				continue
 			}
 
+			DPrintf("CLIENT: Get reply key:%v, reqId:%+v, reply:%+v", key, req.ReqId, reply)
+
 			switch reply.Err {
 			case OK, ErrDupRequest:
 				if i != 0 {
-					ck.mu.Lock()
+					ck.knownLeaderRWLock.Lock()
 					ck.knownLeader = curServerId
-					ck.mu.Unlock()
+					ck.knownLeaderRWLock.Unlock()
 				}
 				// DPrintf("CLIENT: Get success. key:%v info on server %v: %+v", key, curServerId, reply)
 				return reply.Value, reply.Index
-			case ErrNotRunning, ErrWrongLeader:
 			case ErrNoKey:
 				return "", -1
+			case ErrNotRunning, ErrWrongLeader:
 			case ErrCommitFail, ErrCommitTimeout:
 				// DPrintf("CLIENT: Get fail, commitfail or timeout. key:%v info on server %v: %+v", key, curServerId, reply.Err)
 			}
-			// case ErrCommitTimeout:
-			// 	// maybe 还是Leader，也可能是网络分区了，暂时重试其他的服务器
 
 			i++
 
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 
-	return "", -1
 }
 
 // shared by Put and Append.
@@ -110,38 +107,35 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 }
 func (ck *Clerk) PutAppendTmp(key string, value string, op string) int {
 	// You will have to modify this function.
-	// var req PutAppendArgs
-	// var reply PutAppendReply
 	baseReq := PutAppendArgs{Key: key, Value: value, Op: op, ReqId: ReqIdentity{UUID: newUUID()}}
 	baseReply := PutAppendReply{}
 
 	for { // 无限尝试
-		ck.mu.Lock()
+		DPrintf("Client start send")
+		ck.knownLeaderRWLock.RLock()
 		knownLeader := ck.knownLeader
-		ck.mu.Unlock()
+		ck.knownLeaderRWLock.RUnlock()
+		DPrintf("Client get known leader")
 
 		i := 0
 		for i < len(ck.servers) {
 			req, reply := baseReq, baseReply
 			curServerId := (i + knownLeader) % len(ck.servers)
+			DPrintf("start to call putappend")
 			f := ck.servers[curServerId].Call("KVServer.PutAppend", &req, &reply)
 			if !f {
 				i++
 				continue
 			}
 
-			// if op == "Put" {
-			// 	DPrintf("CLIENT: issue put key:%v value:%v on server %v: %+v, reqId:%v", key, value, curServerId, reply, req.ReqId)
-			// } else {
-			// 	DPrintf("CLIENT: issue append key:%v value:%v on server %v: %+v, reqId:%v", key, value, curServerId, reply, req.ReqId)
-			// }
+			DPrintf("CLIENT: PutAppend reply key:%v, reqId:%+v, reply:%+v", key, req.ReqId, reply)
 
 			switch reply.Err {
 			case OK, ErrDupRequest:
 				if i != 0 {
-					ck.mu.Lock()
+					ck.knownLeaderRWLock.Lock()
 					ck.knownLeader = curServerId
-					ck.mu.Unlock()
+					ck.knownLeaderRWLock.Unlock()
 				}
 				// DPrintf("CLIENT: Put success. key:%v info on server %v: %+v", key, curServerId, reply)
 				return reply.Index
@@ -158,7 +152,6 @@ func (ck *Clerk) PutAppendTmp(key string, value string, op string) int {
 
 			// DPrintf("Get fail. key:%v info on server %v: %v", key, i, reply)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
